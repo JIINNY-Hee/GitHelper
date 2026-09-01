@@ -23,7 +23,17 @@ PowerShell에서 `ps2exe` 모듈을 설치한 다음 실행합니다.
 
 ```powershell
 Install-Module ps2exe -Scope CurrentUser
-.\Build-Release.ps1 -Version 1.0.0
+.\Source\Build-Release.ps1 -Version 1.0.2
 ```
 
 버전별 변경사항은 [CHANGELOG.md](CHANGELOG.md)를 참고하세요.
+
+## 저장소 구조
+
+```text
+.github/workflows/   GitHub Actions 설정(루트 위치 필수)
+Source/              PowerShell 소스, 아이콘, 빌드 및 실행 스크립트
+EXE/                 로컬 빌드 결과물(Git 저장소에는 포함하지 않음)
+README.md            사용 및 빌드 안내
+CHANGELOG.md         버전별 변경 내역
+```

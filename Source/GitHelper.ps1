@@ -17,8 +17,8 @@ $env:LANG = 'ko_KR.UTF-8'
 $env:LC_ALL = 'ko_KR.UTF-8'
 
 
-$AppName = 'GitHelper v1.0.0'
-$AppVersion = [version]'1.0.0'
+$AppName = 'GitHelper v1.0.2'
+$AppVersion = [version]'1.0.2'
 $GitHubRepo = 'JIINNY-Hee/GitHelper'
 $ConfigDir = Join-Path $env:APPDATA 'GitHelper'
 $ConfigPath = Join-Path $ConfigDir 'config.json'
@@ -466,42 +466,76 @@ function Merge-CurrentBranchToDevelop {
 
     Set-Busy $true
     $sourceBranch = $null
+    $stashHash = $null
     try {
         $state = Get-RepoState $repo
         $sourceBranch = $state.Branch
         if (-not $sourceBranch) { throw '분리된 HEAD 상태에서는 병합할 수 없습니다.' }
         if ($sourceBranch -eq 'develop') { throw '현재 브랜치가 이미 develop입니다.' }
-        if ($state.Dirty) { throw "커밋되지 않은 변경사항이 있습니다.`r`n`r`n$($state.StatusText)" }
 
-        $answer = [System.Windows.Forms.MessageBox]::Show("현재 브랜치를 develop에 직접 병합하고 push합니다.`r`n`r`n$sourceBranch  →  develop`r`n`r`n계속할까요?", $AppName, 'YesNo', 'Warning')
+        $dirtyNotice = if ($state.Dirty) { "`r`n`r`n미커밋 파일은 자동으로 임시 보관한 뒤 원래 브랜치에 복원합니다." } else { '' }
+        $answer = [System.Windows.Forms.MessageBox]::Show("현재 브랜치로 develop 대상 PR을 만들고 병합합니다.`r`n`r`n$sourceBranch  →  develop$dirtyNotice`r`n`r`n계속할까요?", $AppName, 'YesNo', 'Warning')
         if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) { return }
 
-        Append-Log "develop으로 이동: $sourceBranch → develop"
-        $checkout = Invoke-Git -GitArgs @('switch','develop')
-        if ($checkout.ExitCode -ne 0) { throw "develop 이동 실패:`r`n$($checkout.StdErr)" }
-
-        Append-Log '원격 develop을 fast-forward로 동기화합니다...'
-        $pull = Invoke-Git -GitArgs @('pull','--ff-only','origin','develop')
-        if ($pull.ExitCode -ne 0) { throw "develop 동기화 실패:`r`n$($pull.StdErr)" }
-
-        Append-Log "브랜치 병합: $sourceBranch"
-        $merge = Invoke-Git -GitArgs @('merge','--no-ff',$sourceBranch,'-m',"Merge branch '$sourceBranch' into develop")
-        if ($merge.ExitCode -ne 0) {
-            [void](Invoke-Git -GitArgs @('merge','--abort'))
-            throw "병합 충돌이 발생하여 병합을 취소했습니다.`r`n`r`n$($merge.StdErr)"
+        if ($state.Dirty) {
+            Append-Log '미커밋 파일을 안전하게 임시 보관합니다...'
+            $stash = Invoke-Git -GitArgs @('stash','push','-u','-m',"GitHelper merge $(Get-Date -Format s)")
+            if ($stash.ExitCode -ne 0) { throw "stash 실패:`r`n$($stash.StdErr)" }
+            $stashRef = Invoke-Git -GitArgs @('rev-parse','stash@{0}')
+            if ($stashRef.ExitCode -ne 0) { throw '생성한 stash를 확인하지 못했습니다.' }
+            $stashHash = $stashRef.StdOut
+            Append-Log "미커밋 파일 보관 완료: $($stashHash.Substring(0,8))"
         }
 
-        Append-Log 'develop을 origin에 push합니다...'
-        $push = Invoke-Git -GitArgs @('push','origin','develop')
-        if ($push.ExitCode -ne 0) { throw "develop push 실패:`r`n$($push.StdErr)" }
+        Append-Log "현재 브랜치를 origin에 push합니다: $sourceBranch"
+        $push = Invoke-Git -GitArgs @('push','-u','origin',$sourceBranch)
+        if ($push.ExitCode -ne 0) { throw "현재 브랜치 push 실패:`r`n$($push.StdErr)" }
+
+        if (-not (Ensure-GitHubHttpsAuth)) { throw 'GitHub 인증을 완료하지 못했습니다.' }
+        $title = if ($state.Commits.Count -gt 0) { $state.Commits[-1].Subject } else { "Merge $sourceBranch into develop" }
+        $body = "GitHelper에서 현재 브랜치 '$sourceBranch'를 develop에 병합하기 위해 생성한 PR입니다."
+
+        Append-Log 'develop 대상 PR을 생성합니다...'
+        $pr = Invoke-Gh -GhArgs @('pr','create','--base','develop','--head',$sourceBranch,'--title',$title,'--body',$body)
+        if ($pr.ExitCode -eq 0) {
+            $prUrl = ($pr.StdOut -split "`r?`n" | Select-Object -Last 1).Trim()
+        } else {
+            $existing = Invoke-Gh -GhArgs @('pr','view',$sourceBranch,'--json','url','--jq','.url')
+            if ($existing.ExitCode -ne 0) { throw "PR 생성 실패:`r`n$($pr.StdErr)" }
+            $prUrl = $existing.StdOut.Trim()
+            Append-Log "기존 PR을 사용합니다: $prUrl"
+        }
+
+        Append-Log 'PR을 merge 합니다...'
+        $merge = Invoke-Gh -GhArgs @('pr','merge',$sourceBranch,'--merge')
+        if ($merge.ExitCode -ne 0) { throw "PR 병합이 완료되지 않았습니다.`r`n리뷰나 CI 조건을 확인해 주세요.`r`n`r`nPR: $prUrl`r`n`r`n$($merge.StdErr)" }
+
+        Append-Log '병합된 origin/develop을 동기화합니다...'
+        $fetch = Invoke-Git -GitArgs @('fetch','origin','--prune')
+        if ($fetch.ExitCode -ne 0) { throw "병합 후 fetch 실패:`r`n$($fetch.StdErr)" }
+        $checkout = Invoke-Git -GitArgs @('switch','develop')
+        if ($checkout.ExitCode -ne 0) { throw "develop 이동 실패:`r`n$($checkout.StdErr)" }
+        $sync = Invoke-Git -GitArgs @('reset','--hard','origin/develop')
+        if ($sync.ExitCode -ne 0) { throw "로컬 develop 동기화 실패:`r`n$($sync.StdErr)" }
+
+        $back = Invoke-Git -GitArgs @('switch',$sourceBranch)
+        if ($back.ExitCode -ne 0) { throw "원래 브랜치 '$sourceBranch' 복귀 실패:`r`n$($back.StdErr)" }
+        if ($stashHash) {
+            Restore-Stash $stashHash
+            $stashHash = $null
+        }
         Append-Log '현재 브랜치를 develop에 병합했습니다.'
-        Show-Info "$sourceBranch 브랜치를 develop에 병합하고 push했습니다."
+        Show-Info "$sourceBranch 브랜치를 PR을 통해 develop에 병합했습니다.`r`n`r`n$prUrl"
     }
     catch {
         Append-Log "develop 병합 중단: $($_.Exception.Message)"
         if ($sourceBranch) {
             $current = Invoke-Git -GitArgs @('branch','--show-current')
             if ($current.ExitCode -eq 0 -and $current.StdOut -ne $sourceBranch) { [void](Invoke-Git -GitArgs @('switch',$sourceBranch)) }
+        }
+        if ($stashHash) {
+            Restore-Stash $stashHash
+            $stashHash = $null
         }
         Show-Error $_.Exception.Message
     }
@@ -594,9 +628,21 @@ function Restore-Stash([string]$StashHash) {
         Show-Error "Git 작업은 끝났지만 작업 파일 자동 복원 중 충돌이 발생했습니다.`r`n`r`n보존된 stash: $StashHash`r`nFork에서 충돌 상태를 확인해 주세요."
         return
     }
-    $drop = Invoke-Git -GitArgs @('stash','drop',$StashHash)
-    if ($drop.ExitCode -ne 0) { Append-Log 'stash 복원은 성공했지만 자동 삭제는 실패했습니다.' }
-    else { Append-Log '미커밋 작업 파일 복원 완료.' }
+    $stashList = Invoke-Git -GitArgs @('stash','list','--format=%gd%x09%H')
+    $stashRef = $null
+    if ($stashList.ExitCode -eq 0 -and $stashList.StdOut) {
+        foreach ($line in ($stashList.StdOut -split "`r?`n")) {
+            $parts = $line -split "`t",2
+            if ($parts.Count -eq 2 -and $parts[1] -eq $StashHash) { $stashRef = $parts[0]; break }
+        }
+    }
+    if ($stashRef) {
+        $drop = Invoke-Git -GitArgs @('stash','drop',$stashRef)
+        if ($drop.ExitCode -ne 0) { Append-Log 'stash 복원은 성공했지만 자동 삭제는 실패했습니다.' }
+        else { Append-Log '미커밋 작업 파일 복원 완료.' }
+    } else {
+        Append-Log '미커밋 작업 파일은 복원됐지만 stash 위치를 찾지 못해 보관 항목을 유지합니다.'
+    }
 }
 
 function Run-Workflow {
@@ -804,7 +850,7 @@ $form.Font = New-Object System.Drawing.Font('Malgun Gothic',10,[System.Drawing.F
 try { $form.Icon = [System.Drawing.Icon]::ExtractAssociatedIcon([Diagnostics.Process]::GetCurrentProcess().MainModule.FileName) } catch {}
 
 $lblTitle = New-Object System.Windows.Forms.Label
-$lblTitle.Text = 'GitHelper v1.0.0'
+$lblTitle.Text = 'GitHelper v1.0.2'
 $lblTitle.Font = New-Object System.Drawing.Font('Malgun Gothic',18,[System.Drawing.FontStyle]::Bold)
 $lblTitle.AutoSize = $true
 $lblTitle.Location = New-Object System.Drawing.Point(24,18)
