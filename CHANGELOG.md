@@ -2,14 +2,6 @@
 
 이 문서는 기존 CQI Git Helper v9 이후의 변경사항을 기록합니다. 제품명과 공개 버전 체계는 GitHelper v1.0.0부터 새로 시작합니다.
 
-## GitHelper v1.0.2 - 2026-09-01
-
-### 수정
-
-- 보호된 `develop` 브랜치에 직접 push해 `GH013` 오류가 발생하던 문제 수정
-- 현재 브랜치 병합 기능을 GitHub PR 생성 및 PR merge 방식으로 변경
-- 이전 직접 push 실패로 로컬 `develop`에 남을 수 있는 커밋을 병합 성공 후 `origin/develop` 기준으로 동기화
-
 ## GitHelper v1.0.1 - 2026-09-01
 
 ### 수정
@@ -17,6 +9,9 @@
 - 현재 브랜치를 `develop`에 병합할 때 미커밋 파일이 있으면 작업을 차단하지 않고 자동 stash로 보호
 - 병합과 push 완료 후 원래 브랜치로 돌아와 미커밋 파일 자동 복원
 - 병합 실패 시에도 원래 브랜치 복귀와 stash 복원을 시도하도록 안전 처리
+- 보호된 `develop` 브랜치에 직접 push해 `GH013` 오류가 발생하던 문제 수정
+- 현재 브랜치 병합 기능을 GitHub PR 생성 및 PR merge 방식으로 변경
+- 이전 직접 push 실패로 로컬 `develop`에 남을 수 있는 커밋을 병합 성공 후 `origin/develop` 기준으로 동기화
 
 ## GitHelper v1.0.0 - 2026-09-01
 
