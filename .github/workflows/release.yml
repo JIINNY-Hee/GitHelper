@@ -22,12 +22,12 @@ jobs:
         shell: powershell
         run: |
           $version = '${{ github.ref_name }}'.TrimStart('v')
-          .\Build-Release.ps1 -Version $version
+          .\Source\Build-Release.ps1 -Version $version
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           body_path: CHANGELOG.md
           files: |
-            GitHelper.exe
-            GitHelper.zip
+            EXE/GitHelper.exe
+            EXE/GitHelper.zip
