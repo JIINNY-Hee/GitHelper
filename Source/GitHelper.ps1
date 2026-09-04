@@ -17,14 +17,12 @@ $env:LANG = 'ko_KR.UTF-8'
 $env:LC_ALL = 'ko_KR.UTF-8'
 
 
-$AppName = 'GitHelper v1.0.1'
-$AppVersion = [version]'1.0.1'
+$AppName = 'GitHelper v1.0.2'
+$AppVersion = [version]'1.0.2'
 $GitHubRepo = 'JIINNY-Hee/GitHelper'
 $ConfigDir = Join-Path $env:APPDATA 'GitHelper'
 $ConfigPath = Join-Path $ConfigDir 'config.json'
 $LegacyConfigPath = Join-Path (Join-Path $env:APPDATA 'CQIGitHelper') 'config.json'
-$ExpectedOriginSsh = 'git@github.com:loadcomplete-corp/cqi_client.git'
-$ExpectedOriginHttps = 'https://github.com/loadcomplete-corp/cqi_client.git'
 
 function Show-Error([string]$Message) {
     [System.Windows.Forms.MessageBox]::Show($Message, $AppName, 'OK', 'Error') | Out-Null
@@ -105,6 +103,13 @@ function Invoke-ProcessText {
 
 $script:CurrentRepo = $null
 $script:VisibleCommits = @()
+$script:VisiblePushedCommits = @()
+$script:FavoriteRepos = @()
+$script:LoadingRepoList = $false
+$script:LoadedRepoPath = $null
+$script:BaseBranches = @{}
+$script:AvailableBaseBranches = @()
+$script:LoadingBaseBranch = $false
 
 function Invoke-Git {
     param([Parameter(Mandatory=$true)][string[]]$GitArgs)
@@ -132,17 +137,70 @@ function Invoke-Gh {
 
 function Save-Config([string]$RepoPath) {
     if (-not (Test-Path $ConfigDir)) { New-Item -ItemType Directory -Path $ConfigDir -Force | Out-Null }
-    @{ repoPath = $RepoPath } | ConvertTo-Json | Set-Content -Path $ConfigPath -Encoding UTF8
+    @{
+        repoPath = $RepoPath
+        favoriteRepos = @($script:FavoriteRepos)
+        baseBranches = $script:BaseBranches
+    } | ConvertTo-Json -Depth 6 | Set-Content -Path $ConfigPath -Encoding UTF8
 }
 
 function Load-Config {
     $loadPath = if (Test-Path $ConfigPath) { $ConfigPath } elseif (Test-Path $LegacyConfigPath) { $LegacyConfigPath } else { $null }
     if ($loadPath) {
         try {
-            return (Get-Content $loadPath -Raw | ConvertFrom-Json).repoPath
+            $config = Get-Content $loadPath -Raw | ConvertFrom-Json
+            $script:FavoriteRepos = @($config.favoriteRepos | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -Unique)
+            $script:BaseBranches = @{}
+            if ($config.baseBranches) {
+                foreach ($property in $config.baseBranches.PSObject.Properties) { $script:BaseBranches[$property.Name] = [string]$property.Value }
+            }
+            return $config.repoPath
         } catch { return $null }
     }
     return $null
+}
+
+function Sync-FavoriteRepoControl([string]$SelectedPath) {
+    $script:LoadingRepoList = $true
+    try {
+        $txtRepo.Items.Clear()
+        foreach ($path in ($script:FavoriteRepos | Sort-Object)) { [void]$txtRepo.Items.Add($path) }
+        if ($SelectedPath) { $txtRepo.Text = $SelectedPath }
+    } finally { $script:LoadingRepoList = $false }
+}
+
+function Sync-BaseBranchControl([string]$RepoPath) {
+    $script:LoadingBaseBranch = $true
+    try {
+        $cmbBaseBranch.Items.Clear()
+        foreach ($branch in $script:AvailableBaseBranches) { [void]$cmbBaseBranch.Items.Add($branch) }
+        $selected = if ($RepoPath -and $script:BaseBranches.ContainsKey($RepoPath)) { $script:BaseBranches[$RepoPath] } else { 'develop' }
+        $cmbBaseBranch.Text = $selected
+        $dropDownWidth = $cmbBaseBranch.Width
+        foreach ($branch in $script:AvailableBaseBranches) {
+            $measured = [System.Windows.Forms.TextRenderer]::MeasureText([string]$branch, $cmbBaseBranch.Font).Width + 32
+            if ($measured -gt $dropDownWidth) { $dropDownWidth = $measured }
+        }
+        $cmbBaseBranch.DropDownWidth = [Math]::Min(500, $dropDownWidth)
+    } finally { $script:LoadingBaseBranch = $false }
+}
+
+function Add-CurrentRepoFavorite {
+    $path = $txtRepo.Text.Trim()
+    if (-not $path -or -not (Test-Path -LiteralPath $path)) { Show-Error '즐겨찾기에 추가할 올바른 저장소 경로를 선택해 주세요.'; return }
+    $resolved = (Resolve-Path -LiteralPath $path).Path
+    if ($script:FavoriteRepos -notcontains $resolved) { $script:FavoriteRepos += $resolved }
+    Sync-FavoriteRepoControl $resolved
+    Save-Config $resolved
+    Append-Log "레포 즐겨찾기 추가: $resolved"
+}
+
+function Remove-CurrentRepoFavorite {
+    $path = $txtRepo.Text.Trim()
+    $script:FavoriteRepos = @($script:FavoriteRepos | Where-Object { $_ -ne $path })
+    Sync-FavoriteRepoControl $path
+    Save-Config $path
+    Append-Log "레포 즐겨찾기 제거: $path"
 }
 
 function Test-CommandAvailable([string]$Name) {
@@ -208,65 +266,29 @@ function Ensure-GitHubHttpsAuth {
     return $true
 }
 
-function Switch-OriginToHttps {
-    Append-Log "origin을 HTTPS 주소로 변경합니다: $ExpectedOriginHttps"
-    $set = Invoke-Git -GitArgs @('remote','set-url','origin',$ExpectedOriginHttps)
-    if ($set.ExitCode -ne 0) { throw "origin HTTPS 전환 실패:`r`n$($set.StdErr)" }
-    return $ExpectedOriginHttps
-}
-
-function Normalize-Origin {
-    $origin = Invoke-Git -GitArgs @('remote','get-url','origin')
-    if ($origin.ExitCode -ne 0) { throw 'origin remote를 찾을 수 없습니다.' }
-
-    if ($origin.StdOut -eq $ExpectedOriginSsh -or $origin.StdOut -eq $ExpectedOriginHttps) {
-        return $origin.StdOut
-    }
-
-    # cq_idle -> cqi_client rename or any unexpected origin.
-    $msg = "현재 origin:`r`n$($origin.StdOut)`r`n`r`n현재 저장소 주소로 자동 수정할까요?`r`n$ExpectedOriginHttps`r`n`r`nHTTPS를 사용하면 SSH 키 설정 없이 GitHub 로그인으로 인증할 수 있습니다."
-    $answer = [System.Windows.Forms.MessageBox]::Show($msg, $AppName, 'YesNo', 'Question')
-    if ($answer -eq [System.Windows.Forms.DialogResult]::Yes) {
-        return Switch-OriginToHttps
-    }
-    return $origin.StdOut
-}
-
-function Fetch-OriginWithRepair {
-    param([string]$OriginUrl)
-
+function Fetch-Origin {
     $fetch = Invoke-Git -GitArgs @('fetch','origin','--prune')
     if ($fetch.ExitCode -eq 0) { return $true }
-
-    $err = $fetch.StdErr
-    $isSshProblem = ($err -match 'Permission denied \(publickey\)') -or ($err -match 'Could not read from remote repository') -or ($OriginUrl -match '^git@github\.com:')
-    $isHttpsAuthProblem = ($err -match 'Authentication failed') -or ($err -match 'could not read Username') -or ($err -match '403')
-
-    if (-not ($isSshProblem -or $isHttpsAuthProblem)) {
-        throw "origin fetch 실패:`r`n$err"
-    }
-
-    $msg = "GitHub 인증에 실패했습니다.`r`n`r`n$err`r`n`r`n프로그램이 다음 작업을 자동으로 처리할 수 있습니다:`r`n- origin을 HTTPS로 전환`r`n- GitHub 로그인 확인/실행`r`n- Git 자격 증명 연결`r`n- fetch 재시도`r`n`r`n자동 복구할까요?"
-    $answer = [System.Windows.Forms.MessageBox]::Show($msg, $AppName, 'YesNo', 'Question')
-    if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) {
-        throw "origin fetch 실패:`r`n$err"
-    }
-
-    if (-not (Ensure-GitHubHttpsAuth)) {
-        throw 'GitHub 인증 자동 복구가 완료되지 않았습니다.'
-    }
-
-    [void](Switch-OriginToHttps)
-    Append-Log 'HTTPS 인증으로 origin fetch를 다시 시도합니다...'
-    $retry = Invoke-Git -GitArgs @('fetch','origin','--prune')
-    if ($retry.ExitCode -ne 0) {
-        throw "HTTPS 전환 후에도 origin fetch에 실패했습니다:`r`n$($retry.StdErr)"
-    }
-    Append-Log 'GitHub 인증 복구 및 fetch 성공.'
-    return $true
+    throw "origin fetch 실패:`r`n$($fetch.StdErr)`r`n`r`n저장소의 origin 주소는 변경하지 않았습니다. Git/Fork 인증 설정을 확인해 주세요."
 }
 
-function Get-RepoState([string]$Repo) {
+function Remove-RemoteBranch([string]$BranchName) {
+    if (-not $BranchName) { throw '삭제할 원격 브랜치 이름이 비어 있습니다.' }
+    Append-Log "원격 브랜치 삭제 요청: origin/$BranchName"
+    $delete = Invoke-Git -GitArgs @('push','origin','--delete',$BranchName)
+    $verify = Invoke-Git -GitArgs @('ls-remote','--exit-code','--heads','origin',$BranchName)
+    if ($verify.ExitCode -eq 0 -and $verify.StdOut) {
+        $detail = if ($delete.StdErr) { $delete.StdErr } else { '원격 저장소가 삭제 요청 후에도 브랜치를 반환했습니다.' }
+        throw "원격 브랜치 'origin/$BranchName' 삭제에 실패했습니다.`r`n`r`n$detail"
+    }
+    if ($verify.ExitCode -ne 2) {
+        throw "원격 브랜치 삭제 여부를 확인하지 못했습니다.`r`n`r`n$($verify.StdErr)"
+    }
+    [void](Invoke-Git -GitArgs @('fetch','origin','--prune'))
+    Append-Log "원격 feature 브랜치 삭제 확인 완료: origin/$BranchName"
+}
+
+function Get-RepoState([string]$Repo, [switch]$Fast) {
     if (-not $Repo -or -not (Test-Path -LiteralPath $Repo)) { throw '선택한 저장소 폴더가 존재하지 않습니다.' }
     $script:CurrentRepo = (Resolve-Path -LiteralPath $Repo).Path
     $inside = Invoke-Git -GitArgs @('rev-parse','--is-inside-work-tree')
@@ -277,17 +299,27 @@ function Get-RepoState([string]$Repo) {
     $Repo = $root.StdOut
     $script:CurrentRepo = $Repo
 
-    $origin = Normalize-Origin
-    [void](Fetch-OriginWithRepair -OriginUrl $origin)
-    $origin = (Invoke-Git -GitArgs @('remote','get-url','origin')).StdOut
+    $originResult = Invoke-Git -GitArgs @('remote','get-url','origin')
+    if ($originResult.ExitCode -ne 0) { throw 'origin remote를 찾을 수 없습니다.' }
+    $origin = $originResult.StdOut
+    if (-not $Fast) {
+        [void](Fetch-Origin)
+    }
 
-    $base = Invoke-Git -GitArgs @('rev-parse','--verify','origin/develop')
-    if ($base.ExitCode -ne 0) { throw 'origin/develop 브랜치를 찾을 수 없습니다.' }
+    $branchRefs = Invoke-Git -GitArgs @('for-each-ref','--format=%(refname:short)','refs/remotes/origin')
+    $script:AvailableBaseBranches = if ($branchRefs.ExitCode -eq 0 -and $branchRefs.StdOut) {
+        @($branchRefs.StdOut -split "`r?`n" | Where-Object { $_ -match '^origin/.+' -and $_ -ne 'origin/HEAD' } | ForEach-Object { $_.Substring(7) } | Sort-Object -Unique)
+    } else { @() }
+    $baseBranch = if ($script:BaseBranches.ContainsKey($Repo)) { $script:BaseBranches[$Repo] } else { 'develop' }
+    $baseRef = "origin/$baseBranch"
+    $base = Invoke-Git -GitArgs @('rev-parse','--verify',$baseRef)
+    if ($base.ExitCode -ne 0) { throw "설정한 기본 브랜치 '$baseBranch'를 origin에서 찾을 수 없습니다. 기본 브랜치를 변경해 주세요." }
 
     $branch = Invoke-Git -GitArgs @('branch','--show-current')
     $head = Invoke-Git -GitArgs @('rev-parse','HEAD')
-    $status = Invoke-Git -GitArgs @('status','--porcelain=v1')
-    $log = Invoke-Git -GitArgs @('log','--reverse','--encoding=UTF-8','--format=%H%x09%h%x09%s','origin/develop..HEAD')
+    $statusArgs = if ($Fast) { @('status','--porcelain=v1','--untracked-files=no') } else { @('status','--porcelain=v1') }
+    $status = Invoke-Git -GitArgs $statusArgs
+    $log = Invoke-Git -GitArgs @('log','--reverse','--encoding=UTF-8','--format=%H%x09%h%x09%s',"$baseRef..HEAD")
 
     $commits = @()
     if ($log.ExitCode -eq 0 -and $log.StdOut) {
@@ -303,12 +335,28 @@ function Get-RepoState([string]$Repo) {
     [pscustomobject]@{
         Repo = $Repo
         Origin = $origin
+        BaseRef = $baseRef
+        BaseBranch = $baseBranch
         Branch = $branch.StdOut
         Head = $head.StdOut
         Dirty = [bool]$status.StdOut
         StatusText = $status.StdOut
         Commits = $commits
     }
+}
+
+function Get-MyPushedCommits {
+    $emailResult = Invoke-Git -GitArgs @('config','user.email')
+    if ($emailResult.ExitCode -ne 0 -or -not $emailResult.StdOut.Trim()) { return @() }
+    $log = Invoke-Git -GitArgs @('log','--remotes=origin',"--author=$($emailResult.StdOut.Trim())",'--date=format-local:%Y-%m-%d %H:%M','--format=%H%x09%h%x09%ad%x09%s','-n','200')
+    $commits = @()
+    if ($log.ExitCode -eq 0 -and $log.StdOut) {
+        foreach ($line in ($log.StdOut -split "`r?`n")) {
+            $parts = $line -split "`t",4
+            if ($parts.Count -eq 4) { $commits += [pscustomobject]@{ Full=$parts[0]; Short=$parts[1]; Date=$parts[2]; Subject=$parts[3] } }
+        }
+    }
+    return $commits
 }
 
 function Make-BranchSuggestion($Commits) {
@@ -422,11 +470,15 @@ function Append-Log([string]$Text) {
 function Set-Busy([bool]$Busy) {
     $btnRefresh.Enabled = -not $Busy
     $btnBrowse.Enabled = -not $Busy
+    $btnAddFavorite.Enabled = -not $Busy
+    $btnRemoveFavorite.Enabled = -not $Busy
     $btnRun.Enabled = -not $Busy
     $btnDeleteCommit.Enabled = (-not $Busy) -and ($script:VisibleCommits.Count -gt 0)
+    $btnChangedFiles.Enabled = (-not $Busy) -and (($script:VisibleCommits.Count -gt 0) -or ($script:VisiblePushedCommits.Count -gt 0))
     $btnCreateBranch.Enabled = -not $Busy
-    $btnMergeDevelop.Enabled = -not $Busy
+    $btnMergeDevelop.Enabled = (-not $Busy) -and ($btnMergeDevelop.Tag -eq 'Allowed')
     $btnUpdate.Enabled = -not $Busy
+    $cmbBaseBranch.Enabled = -not $Busy
     $txtRepo.Enabled = -not $Busy
     $txtBranch.Enabled = -not $Busy
     $radioDelete.Enabled = -not $Busy
@@ -467,14 +519,17 @@ function Merge-CurrentBranchToDevelop {
     Set-Busy $true
     $sourceBranch = $null
     $stashHash = $null
+    $stashWasUsed = $false
     try {
         $state = Get-RepoState $repo
         $sourceBranch = $state.Branch
+        $baseBranch = $state.BaseBranch
         if (-not $sourceBranch) { throw '분리된 HEAD 상태에서는 병합할 수 없습니다.' }
-        if ($sourceBranch -eq 'develop') { throw '현재 브랜치가 이미 develop입니다.' }
+        if ($sourceBranch -eq 'main') { throw 'main 브랜치는 직접 push하거나 작업 브랜치로 병합할 수 없습니다.' }
+        if ($sourceBranch -eq $baseBranch) { throw "현재 브랜치가 이미 기본 브랜치 '$baseBranch'입니다." }
 
         $dirtyNotice = if ($state.Dirty) { "`r`n`r`n미커밋 파일은 자동으로 임시 보관한 뒤 원래 브랜치에 복원합니다." } else { '' }
-        $answer = [System.Windows.Forms.MessageBox]::Show("현재 브랜치로 develop 대상 PR을 만들고 병합합니다.`r`n`r`n$sourceBranch  →  develop$dirtyNotice`r`n`r`n계속할까요?", $AppName, 'YesNo', 'Warning')
+        $answer = [System.Windows.Forms.MessageBox]::Show("현재 브랜치로 $baseBranch 대상 PR을 만들고 병합합니다.`r`n`r`n$sourceBranch  →  $baseBranch$dirtyNotice`r`n`r`n계속할까요?", $AppName, 'YesNo', 'Warning')
         if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) { return }
 
         if ($state.Dirty) {
@@ -484,6 +539,7 @@ function Merge-CurrentBranchToDevelop {
             $stashRef = Invoke-Git -GitArgs @('rev-parse','stash@{0}')
             if ($stashRef.ExitCode -ne 0) { throw '생성한 stash를 확인하지 못했습니다.' }
             $stashHash = $stashRef.StdOut
+            $stashWasUsed = $true
             Append-Log "미커밋 파일 보관 완료: $($stashHash.Substring(0,8))"
         }
 
@@ -493,10 +549,10 @@ function Merge-CurrentBranchToDevelop {
 
         if (-not (Ensure-GitHubHttpsAuth)) { throw 'GitHub 인증을 완료하지 못했습니다.' }
         $title = if ($state.Commits.Count -gt 0) { $state.Commits[-1].Subject } else { "Merge $sourceBranch into develop" }
-        $body = "GitHelper에서 현재 브랜치 '$sourceBranch'를 develop에 병합하기 위해 생성한 PR입니다."
+        $body = "GitHelper에서 현재 브랜치 '$sourceBranch'를 $baseBranch에 병합하기 위해 생성한 PR입니다."
 
-        Append-Log 'develop 대상 PR을 생성합니다...'
-        $pr = Invoke-Gh -GhArgs @('pr','create','--base','develop','--head',$sourceBranch,'--title',$title,'--body',$body)
+        Append-Log "$baseBranch 대상 PR을 생성합니다..."
+        $pr = Invoke-Gh -GhArgs @('pr','create','--base',$baseBranch,'--head',$sourceBranch,'--title',$title,'--body',$body)
         if ($pr.ExitCode -eq 0) {
             $prUrl = ($pr.StdOut -split "`r?`n" | Select-Object -Last 1).Trim()
         } else {
@@ -506,17 +562,17 @@ function Merge-CurrentBranchToDevelop {
             Append-Log "기존 PR을 사용합니다: $prUrl"
         }
 
-        Append-Log 'PR을 merge 합니다...'
-        $merge = Invoke-Gh -GhArgs @('pr','merge',$sourceBranch,'--merge')
+        Append-Log 'PR을 rebase merge 합니다...'
+        $merge = Invoke-Gh -GhArgs @('pr','merge',$sourceBranch,'--rebase')
         if ($merge.ExitCode -ne 0) { throw "PR 병합이 완료되지 않았습니다.`r`n리뷰나 CI 조건을 확인해 주세요.`r`n`r`nPR: $prUrl`r`n`r`n$($merge.StdErr)" }
 
-        Append-Log '병합된 origin/develop을 동기화합니다...'
+        Append-Log "병합된 origin/$baseBranch을 동기화합니다..."
         $fetch = Invoke-Git -GitArgs @('fetch','origin','--prune')
         if ($fetch.ExitCode -ne 0) { throw "병합 후 fetch 실패:`r`n$($fetch.StdErr)" }
-        $checkout = Invoke-Git -GitArgs @('switch','develop')
-        if ($checkout.ExitCode -ne 0) { throw "develop 이동 실패:`r`n$($checkout.StdErr)" }
-        $sync = Invoke-Git -GitArgs @('reset','--hard','origin/develop')
-        if ($sync.ExitCode -ne 0) { throw "로컬 develop 동기화 실패:`r`n$($sync.StdErr)" }
+        $checkout = Invoke-Git -GitArgs @('switch',$baseBranch)
+        if ($checkout.ExitCode -ne 0) { throw "$baseBranch 이동 실패:`r`n$($checkout.StdErr)" }
+        $sync = Invoke-Git -GitArgs @('reset','--hard',$state.BaseRef)
+        if ($sync.ExitCode -ne 0) { throw "로컬 $baseBranch 동기화 실패:`r`n$($sync.StdErr)" }
 
         $back = Invoke-Git -GitArgs @('switch',$sourceBranch)
         if ($back.ExitCode -ne 0) { throw "원래 브랜치 '$sourceBranch' 복귀 실패:`r`n$($back.StdErr)" }
@@ -524,8 +580,22 @@ function Merge-CurrentBranchToDevelop {
             Restore-Stash $stashHash
             $stashHash = $null
         }
-        Append-Log '현재 브랜치를 develop에 병합했습니다.'
-        Show-Info "$sourceBranch 브랜치를 PR을 통해 develop에 병합했습니다.`r`n`r`n$prUrl"
+
+        if ($radioDelete.Checked -and (-not $stashWasUsed -or $script:LastStashRestoreSucceeded)) {
+            Append-Log '병합한 feature 브랜치를 정리합니다...'
+            $currentAfterMerge = Invoke-Git -GitArgs @('branch','--show-current')
+            if ($currentAfterMerge.ExitCode -eq 0 -and $currentAfterMerge.StdOut -eq $sourceBranch) {
+                [void](Invoke-Git -GitArgs @('switch',$baseBranch))
+            }
+            $delLocal = Invoke-Git -GitArgs @('branch','-D',$sourceBranch)
+            if ($delLocal.ExitCode -eq 0) { Append-Log '로컬 feature 브랜치 삭제 완료.' }
+            else { Append-Log '로컬 feature 브랜치 삭제 실패 또는 이미 없음.' }
+            Remove-RemoteBranch $sourceBranch
+        } else {
+            Append-Log 'feature 브랜치를 유지합니다.'
+        }
+        Append-Log "현재 브랜치를 $baseBranch에 병합했습니다."
+        Show-Info "$sourceBranch 브랜치를 PR을 통해 $baseBranch에 병합했습니다.`r`n`r`n$prUrl"
     }
     catch {
         Append-Log "develop 병합 중단: $($_.Exception.Message)"
@@ -619,8 +689,204 @@ function Undo-LastCommit {
     }
 }
 
+function Show-ChangedFilesWindow {
+    param([string[]]$Paths)
+    $repo = $txtRepo.Text.Trim()
+    if (-not $repo -or -not (Test-Path -LiteralPath $repo)) { Show-Error '올바른 저장소 폴더를 먼저 선택해 주세요.'; return }
+    try {
+        if (-not $PSBoundParameters.ContainsKey('Paths')) {
+            $state = Get-RepoState $repo -Fast
+            $diff = Invoke-Git -GitArgs @('diff','--name-only',"$($state.BaseRef)..HEAD")
+            if ($diff.ExitCode -ne 0) { throw "변경 파일 확인 실패:`r`n$($diff.StdErr)" }
+            $Paths = if ($diff.StdOut) { @($diff.StdOut -split "`r?`n") } else { @() }
+        }
+        $groups = [ordered]@{ Prefab=@(); CSharp=@(); Image=@(); Material=@(); Shader=@() }
+        if ($Paths) {
+            foreach ($path in $Paths) {
+                $path = $path.Trim(); if (-not $path) { continue }
+                $lower = $path.ToLowerInvariant()
+                if ($lower -match '\.prefab$') { $groups.Prefab += $path }
+                elseif ($lower -match '\.cs$') { $groups.CSharp += $path }
+                elseif ($lower -match '\.(png|jpg|jpeg|tga|psd|tif|tiff|gif|bmp|exr|webp|svg)$') { $groups.Image += $path }
+                elseif ($lower -match '\.mat$') { $groups.Material += $path }
+                elseif ($lower -match '\.(shader|shadergraph|shadersubgraph|vfx|compute)$') { $groups.Shader += $path }
+            }
+        }
+        $fileForm = New-Object System.Windows.Forms.Form
+        $fileForm.Text = 'GitHelper - Push 변경 파일'; $fileForm.Size = New-Object System.Drawing.Size(720,620)
+        $fileForm.MinimumSize = New-Object System.Drawing.Size(520,400)
+        $fileForm.StartPosition = 'CenterParent'; $fileForm.Font = New-Object System.Drawing.Font('Malgun Gothic',9)
+        $fileForm.BackColor = [System.Drawing.SystemColors]::Control; $fileForm.ForeColor = [System.Drawing.SystemColors]::ControlText
+        try { $fileForm.Icon = $form.Icon } catch {}
+
+        $definitions = @(
+            @{Title='Prefab';Key='Prefab'}, @{Title='C#';Key='CSharp'},
+            @{Title='이미지';Key='Image'}, @{Title='Material';Key='Material'},
+            @{Title='Shader';Key='Shader'}
+        )
+        $collapsedGroups = @{}
+        $rowKinds = New-Object System.Collections.ArrayList
+
+        $btnExpandAll = New-Object System.Windows.Forms.Button
+        $btnExpandAll.Text = '전체 펼치기'; $btnExpandAll.Location = New-Object System.Drawing.Point(16,14); $btnExpandAll.Size = New-Object System.Drawing.Size(110,30)
+        $fileForm.Controls.Add($btnExpandAll)
+
+        $btnCollapseAll = New-Object System.Windows.Forms.Button
+        $btnCollapseAll.Text = '전체 접기'; $btnCollapseAll.Location = New-Object System.Drawing.Point(134,14); $btnCollapseAll.Size = New-Object System.Drawing.Size(110,30)
+        $fileForm.Controls.Add($btnCollapseAll)
+
+        $changedFilesList = New-Object System.Windows.Forms.ListBox
+        $changedFilesList.Location = New-Object System.Drawing.Point(16,52); $changedFilesList.Size = New-Object System.Drawing.Size(670,485)
+        $changedFilesList.Anchor = 'Top,Bottom,Left,Right'; $changedFilesList.BorderStyle = 'FixedSingle'
+        $changedFilesList.BackColor = [System.Drawing.SystemColors]::Window; $changedFilesList.ForeColor = [System.Drawing.SystemColors]::WindowText
+        $changedFilesList.SelectionMode = [System.Windows.Forms.SelectionMode]::MultiExtended
+        $fileForm.Controls.Add($changedFilesList)
+
+        $hint = New-Object System.Windows.Forms.Label
+        $hint.Text = '분류 제목을 더블 클릭해 접거나 펼칠 수 있습니다.  Ctrl+A: 전체 선택  /  Ctrl+C: 복사'
+        $hint.AutoSize = $true; $hint.Location = New-Object System.Drawing.Point(16,548); $hint.Anchor = 'Bottom,Left'
+        $fileForm.Controls.Add($hint)
+
+        $btnCopyFiles = New-Object System.Windows.Forms.Button
+        $btnCopyFiles.Text = '선택 항목 복사'; $btnCopyFiles.Size = New-Object System.Drawing.Size(140,30)
+        $btnCopyFiles.Location = New-Object System.Drawing.Point(546,14); $btnCopyFiles.Anchor = 'Top,Right'
+        $fileForm.Controls.Add($btnCopyFiles)
+
+        $refreshChangedFilesList = {
+            $changedFilesList.BeginUpdate()
+            try {
+                $changedFilesList.Items.Clear(); $rowKinds.Clear()
+                foreach ($definition in $definitions) {
+                    $key = $definition.Key
+                    if ($groups[$key].Count -eq 0) { continue }
+                    $isCollapsed = [bool]$collapsedGroups[$key]
+                    $marker = if ($isCollapsed) { [char]0x25B6 } else { [char]0x25BC }
+                    [void]$changedFilesList.Items.Add("$marker  $($definition.Title) ($($groups[$key].Count))")
+                    [void]$rowKinds.Add("group:$key")
+                    if (-not $isCollapsed) {
+                        foreach ($item in @($groups[$key] | Sort-Object)) {
+                            [void]$changedFilesList.Items.Add("    $([System.IO.Path]::GetFileNameWithoutExtension($item))")
+                            [void]$rowKinds.Add('file')
+                        }
+                    }
+                }
+            } finally { $changedFilesList.EndUpdate() }
+        }
+
+        $copySelectedFiles = {
+            $lines = New-Object System.Collections.Generic.List[string]
+            foreach ($index in $changedFilesList.SelectedIndices) {
+                if ($rowKinds[[int]$index] -eq 'file') { $lines.Add($changedFilesList.Items[[int]$index].ToString().Trim()) }
+            }
+            if ($lines.Count -gt 0) { [System.Windows.Forms.Clipboard]::SetText(($lines -join "`r`n")) }
+        }
+
+        $changedFilesList.Add_DoubleClick({
+            $index = $changedFilesList.IndexFromPoint($changedFilesList.PointToClient([System.Windows.Forms.Cursor]::Position))
+            if ($index -ge 0 -and $rowKinds[$index] -like 'group:*') {
+                $key = $rowKinds[$index].Substring(6); $collapsedGroups[$key] = -not [bool]$collapsedGroups[$key]
+                & $refreshChangedFilesList
+            }
+        })
+        $changedFilesList.Add_KeyDown({
+            param($sender,$eventArgs)
+            if ($eventArgs.Control -and $eventArgs.KeyCode -eq [System.Windows.Forms.Keys]::A) {
+                for ($index = 0; $index -lt $changedFilesList.Items.Count; $index++) {
+                    $changedFilesList.SetSelected($index, $rowKinds[$index] -eq 'file')
+                }
+                $eventArgs.SuppressKeyPress = $true
+            } elseif ($eventArgs.Control -and $eventArgs.KeyCode -eq [System.Windows.Forms.Keys]::C) {
+                & $copySelectedFiles; $eventArgs.SuppressKeyPress = $true
+            }
+        })
+        $btnCopyFiles.Add_Click({ & $copySelectedFiles })
+        $btnExpandAll.Add_Click({ foreach ($definition in $definitions) { $collapsedGroups[$definition.Key] = $false }; & $refreshChangedFilesList })
+        $btnCollapseAll.Add_Click({ foreach ($definition in $definitions) { $collapsedGroups[$definition.Key] = $true }; & $refreshChangedFilesList })
+        & $refreshChangedFilesList
+        [void]$fileForm.ShowDialog($form); $fileForm.Dispose()
+    } catch { Show-Error $_.Exception.Message }
+}
+
+function Show-SelectedChangedFiles {
+    if ($listPushedCommits.SelectedIndices.Count -gt 0) {
+        $files = New-Object System.Collections.Generic.List[string]
+        foreach ($index in $listPushedCommits.SelectedIndices) {
+            if ([int]$index -ge $script:VisiblePushedCommits.Count) { continue }
+            $result = Invoke-Git -GitArgs @('diff-tree','--root','--no-commit-id','--name-only','-r',$script:VisiblePushedCommits[[int]$index].Full)
+            if ($result.ExitCode -eq 0 -and $result.StdOut) {
+                foreach ($path in ($result.StdOut -split "`r?`n")) {
+                    $path = $path.Trim()
+                    if ($path -and -not $files.Contains($path)) { $files.Add($path) }
+                }
+            }
+        }
+        Show-ChangedFilesWindow -Paths @($files)
+        return
+    }
+    Show-ChangedFilesWindow
+}
+
+function Show-LastPushWindow {
+    $repo = $txtRepo.Text.Trim()
+    if (-not $repo -or -not (Test-Path -LiteralPath $repo)) { Show-Error '올바른 저장소 폴더를 먼저 선택해 주세요.'; return }
+    try {
+        [void](Get-RepoState $repo)
+        $emailResult = Invoke-Git -GitArgs @('config','user.email')
+        if ($emailResult.ExitCode -ne 0 -or -not $emailResult.StdOut.Trim()) { throw 'Git user.email이 설정되어 있지 않아 내 Push 커밋을 구분할 수 없습니다.' }
+        $userEmail = $emailResult.StdOut.Trim()
+        $log = Invoke-Git -GitArgs @('log','--remotes=origin','--all-match',"--author=$userEmail",'--date=format-local:%Y-%m-%d %H:%M','--format=%H%x09%h%x09%ad%x09%s','-n','200')
+        if ($log.ExitCode -ne 0) { throw "원격 Push 목록을 읽지 못했습니다:`r`n$($log.StdErr)" }
+        $pushedCommits = @()
+        if ($log.StdOut) {
+            foreach ($line in ($log.StdOut -split "`r?`n")) {
+                $parts = $line -split "`t",4
+                if ($parts.Count -eq 4) { $pushedCommits += [pscustomobject]@{ Full=$parts[0]; Short=$parts[1]; Date=$parts[2]; Subject=$parts[3] } }
+            }
+        }
+
+    $historyForm = New-Object System.Windows.Forms.Form
+    $historyForm.Text = 'GitHelper - 내 Push 목록'; $historyForm.Size = New-Object System.Drawing.Size(820,520)
+    $historyForm.MinimumSize = New-Object System.Drawing.Size(520,340); $historyForm.StartPosition = 'CenterParent'
+    $historyForm.Font = New-Object System.Drawing.Font('Malgun Gothic',9)
+    try { $historyForm.Icon = $form.Icon } catch {}
+
+    $summary = New-Object System.Windows.Forms.Label
+    $summary.Text = "origin에 반영된 내 커밋 ($userEmail)"
+    $summary.Location = New-Object System.Drawing.Point(16,16); $summary.AutoSize = $true
+    $historyForm.Controls.Add($summary)
+
+    $commitList = New-Object System.Windows.Forms.ListBox
+    $commitList.Location = New-Object System.Drawing.Point(16,46); $commitList.Size = New-Object System.Drawing.Size(770,370)
+    $commitList.Anchor = 'Top,Bottom,Left,Right'; $commitList.SelectionMode = [System.Windows.Forms.SelectionMode]::MultiExtended
+    foreach ($commit in $pushedCommits) { [void]$commitList.Items.Add("$($commit.Date)   $($commit.Short)   $($commit.Subject)") }
+    if ($commitList.Items.Count -eq 0) { [void]$commitList.Items.Add('(origin에서 내 커밋을 찾지 못했습니다)') }
+    $historyForm.Controls.Add($commitList)
+
+    $btnHistoryFiles = New-Object System.Windows.Forms.Button
+    $btnHistoryFiles.Text = '선택 커밋의 변경 파일'; $btnHistoryFiles.Size = New-Object System.Drawing.Size(210,32)
+    $btnHistoryFiles.Location = New-Object System.Drawing.Point(576,427); $btnHistoryFiles.Anchor = 'Bottom,Right'
+    $btnHistoryFiles.Enabled = ($pushedCommits.Count -gt 0)
+    $btnHistoryFiles.Add_Click({
+        $files = New-Object System.Collections.Generic.List[string]
+        foreach ($index in $commitList.SelectedIndices) {
+            if ([int]$index -ge $pushedCommits.Count) { continue }
+            $fileResult = Invoke-Git -GitArgs @('diff-tree','--root','--no-commit-id','--name-only','-r',$pushedCommits[[int]$index].Full)
+            if ($fileResult.ExitCode -eq 0 -and $fileResult.StdOut) {
+                foreach ($path in ($fileResult.StdOut -split "`r?`n")) { if ($path.Trim() -and -not $files.Contains($path.Trim())) { $files.Add($path.Trim()) } }
+            }
+        }
+        if ($commitList.SelectedIndices.Count -eq 0) { Show-Info '변경 파일을 볼 커밋을 먼저 선택해 주세요.' }
+        else { Show-ChangedFilesWindow -Paths @($files) }
+    })
+    $historyForm.Controls.Add($btnHistoryFiles)
+
+    [void]$historyForm.ShowDialog($form); $historyForm.Dispose()
+    } catch { Show-Error $_.Exception.Message }
+}
+
 function Restore-Stash([string]$StashHash) {
     if (-not $StashHash) { return }
+    $script:LastStashRestoreSucceeded = $false
     Append-Log '작업 중이던 미커밋 파일을 복원합니다...'
     $apply = Invoke-Git -GitArgs @('stash','apply','--index',$StashHash)
     if ($apply.ExitCode -ne 0) {
@@ -639,7 +905,7 @@ function Restore-Stash([string]$StashHash) {
     if ($stashRef) {
         $drop = Invoke-Git -GitArgs @('stash','drop',$stashRef)
         if ($drop.ExitCode -ne 0) { Append-Log 'stash 복원은 성공했지만 자동 삭제는 실패했습니다.' }
-        else { Append-Log '미커밋 작업 파일 복원 완료.' }
+        else { Append-Log '미커밋 작업 파일 복원 완료.'; $script:LastStashRestoreSucceeded = $true }
     } else {
         Append-Log '미커밋 작업 파일은 복원됐지만 stash 위치를 찾지 못해 보관 항목을 유지합니다.'
     }
@@ -667,7 +933,7 @@ function Run-Workflow {
         $originalBranch = $state.Branch
         $originalHead = $state.Head
 
-        if ($state.Commits.Count -eq 0) { throw 'origin/develop 이후 처리할 커밋이 없습니다.' }
+        if ($state.Commits.Count -eq 0) { throw "$($state.BaseRef) 이후 처리할 커밋이 없습니다." }
 
         $existsLocal = Invoke-Git -GitArgs @('show-ref','--verify','--quiet',"refs/heads/$feature")
         if ($existsLocal.ExitCode -eq 0) { throw "로컬 브랜치 '$feature'가 이미 존재합니다." }
@@ -684,8 +950,8 @@ function Run-Workflow {
             Append-Log "미커밋 파일 보관 완료: $($stashHash.Substring(0,8))"
         }
 
-        Append-Log "origin/develop 기준 feature 생성: $feature"
-        $checkout = Invoke-Git -GitArgs @('checkout','-b',$feature,'origin/develop')
+        Append-Log "$($state.BaseRef) 기준 feature 생성: $feature"
+        $checkout = Invoke-Git -GitArgs @('checkout','-b',$feature,$state.BaseRef)
         if ($checkout.ExitCode -ne 0) { throw "feature 브랜치 생성 실패:`r`n$($checkout.StdErr)" }
 
         foreach ($commit in $state.Commits) {
@@ -703,10 +969,7 @@ function Run-Workflow {
             $pushErr = $push.StdErr
             $authRelated = ($pushErr -match 'Permission denied \(publickey\)') -or ($pushErr -match 'Authentication failed') -or ($pushErr -match 'Could not read from remote repository') -or ($pushErr -match 'could not read Username')
             if ($authRelated) {
-                Append-Log 'push 인증 오류 감지. HTTPS 인증 자동 복구를 시도합니다...'
-                if (-not (Ensure-GitHubHttpsAuth)) { throw "feature push 인증 실패:`r`n$pushErr" }
-                [void](Switch-OriginToHttps)
-                $push = Invoke-Git -GitArgs @('push','-u','origin',$feature)
+                throw "feature push 인증 실패:`r`n$pushErr`r`n`r`n저장소의 origin 주소는 변경하지 않았습니다. Git/Fork 인증 설정을 확인해 주세요."
             }
             if ($push.ExitCode -ne 0) { throw "feature push 실패:`r`n$($push.StdErr)" }
         }
@@ -718,8 +981,8 @@ function Run-Workflow {
         if ($state.Commits.Count -gt 1) { $title = "$title 외 $($state.Commits.Count - 1)건" }
         $body = "GitHelper에서 Fork 커밋 $($state.Commits.Count)개를 추적해 생성한 PR입니다."
 
-        Append-Log 'develop 대상 PR을 생성합니다...'
-        $pr = Invoke-Gh -GhArgs @('pr','create','--base','develop','--head',$feature,'--title',$title,'--body',$body)
+        Append-Log "$($state.BaseBranch) 대상 PR을 생성합니다..."
+        $pr = Invoke-Gh -GhArgs @('pr','create','--base',$state.BaseBranch,'--head',$feature,'--title',$title,'--body',$body)
         if ($pr.ExitCode -ne 0) { throw "PR 생성 실패:`r`n$($pr.StdErr)" }
         $prUrl = ($pr.StdOut -split "`r?`n" | Select-Object -Last 1).Trim()
         Append-Log "PR 생성 완료: $prUrl"
@@ -735,11 +998,11 @@ function Run-Workflow {
         $fetch2 = Invoke-Git -GitArgs @('fetch','origin','--prune')
         if ($fetch2.ExitCode -ne 0) { throw "merge 후 fetch 실패:`r`n$($fetch2.StdErr)" }
 
-        if ($originalBranch -eq 'develop') {
-            $coDev = Invoke-Git -GitArgs @('checkout','develop')
-            if ($coDev.ExitCode -ne 0) { throw "develop checkout 실패:`r`n$($coDev.StdErr)" }
-            $reset = Invoke-Git -GitArgs @('reset','--hard','origin/develop')
-            if ($reset.ExitCode -ne 0) { throw "develop 동기화 실패:`r`n$($reset.StdErr)" }
+        if ($originalBranch -eq $state.BaseBranch) {
+            $coDev = Invoke-Git -GitArgs @('checkout',$state.BaseBranch)
+            if ($coDev.ExitCode -ne 0) { throw "$($state.BaseBranch) checkout 실패:`r`n$($coDev.StdErr)" }
+            $reset = Invoke-Git -GitArgs @('reset','--hard',$state.BaseRef)
+            if ($reset.ExitCode -ne 0) { throw "$($state.BaseBranch) 동기화 실패:`r`n$($reset.StdErr)" }
         } else {
             $back = Invoke-Git -GitArgs @('checkout',$originalBranch)
             if ($back.ExitCode -ne 0) { throw "원래 브랜치 '$originalBranch' 복귀 실패:`r`n$($back.StdErr)" }
@@ -751,17 +1014,17 @@ function Run-Workflow {
         if ($radioDelete.Checked) {
             Append-Log 'feature 브랜치를 정리합니다...'
             if ((Invoke-Git -GitArgs @('branch','--show-current')).StdOut -eq $feature) {
-                [void](Invoke-Git -GitArgs @('checkout','develop'))
+                [void](Invoke-Git -GitArgs @('checkout',$state.BaseBranch))
             }
             $delLocal = Invoke-Git -GitArgs @('branch','-D',$feature)
             if ($delLocal.ExitCode -eq 0) { Append-Log '로컬 feature 삭제 완료.' }
             else { Append-Log '로컬 feature 삭제 실패 또는 이미 없음.' }
 
-            $delRemote = Invoke-Git -GitArgs @('push','origin','--delete',$feature)
-            if ($delRemote.ExitCode -eq 0) { Append-Log '원격 feature 삭제 완료.' }
-            else { Append-Log '원격 feature 삭제 실패 또는 이미 GitHub에서 삭제됨.' }
-        } else {
+            Remove-RemoteBranch $feature
+        } elseif (-not $radioDelete.Checked) {
             Append-Log 'feature 브랜치를 유지합니다.'
+        } else {
+            Append-Log 'stash 복원 충돌 가능성으로 feature 브랜치를 유지합니다.'
         }
 
         Append-Log '모든 작업이 완료되었습니다.'
@@ -793,60 +1056,98 @@ function Run-Workflow {
 
 function Refresh-View {
     $repo = $txtRepo.Text.Trim()
+    $listPushedCommits.Items.Clear()
+    $script:VisiblePushedCommits = @()
     if (-not $repo -or -not (Test-Path $repo)) {
+        $script:AvailableBaseBranches = @()
+        Sync-BaseBranchControl $null
+        $lblPushedCommits.Text = '내 Push 목록 (저장소를 선택해 주세요)'
         $lblStatus.Text = '저장소를 선택해 주세요.'
         $listCommits.Items.Clear()
+        $listPushedCommits.Items.Clear()
         $script:VisibleCommits = @()
+        $script:VisiblePushedCommits = @()
         $btnDeleteCommit.Enabled = $false
+        $btnChangedFiles.Enabled = $false
         $btnRun.Enabled = $false
         $btnCreateBranch.Enabled = $false
         $btnMergeDevelop.Enabled = $false
+        $btnMergeDevelop.Tag = 'Blocked'
         return
     }
 
+    $script:LoadedRepoPath = (Resolve-Path -LiteralPath $repo).Path
+
     try {
-        $state = Get-RepoState $repo
+        $state = Get-RepoState $repo -Fast
+        $script:LoadedRepoPath = $state.Repo
+        Sync-BaseBranchControl $state.Repo
+        $btnMergeDevelop.Text = "현재 브랜치를 $($state.BaseBranch)에 병합"
+        $lblPushedCommits.Text = "내 Push 목록 - $(Split-Path -Leaf $state.Repo)"
         $txtRepo.Text = $state.Repo
         Save-Config $state.Repo
-        $dirtyText = if ($state.Dirty) { '미커밋 파일 있음 (자동 보호)' } else { '작업 폴더 깨끗함' }
-        $lblStatus.Text = "브랜치: $($state.Branch)    |    Origin: $($state.Origin)    |    $dirtyText"
+        $dirtyText = if ($state.Dirty) { '추적 파일 변경 있음 (작업 시 자동 보호)' } else { '추적 파일 변경 없음 (작업 시 전체 확인)' }
+        $lblStatus.Text = "브랜치: $($state.Branch)    |    기준: $($state.BaseBranch)    |    $dirtyText"
         $listCommits.Items.Clear()
         $script:VisibleCommits = @($state.Commits)
         foreach ($c in $state.Commits) {
             [void]$listCommits.Items.Add("$($c.Short)   $($c.Subject)")
         }
+        $script:VisiblePushedCommits = @(Get-MyPushedCommits)
+        foreach ($c in $script:VisiblePushedCommits) {
+            [void]$listPushedCommits.Items.Add("$($c.Date)   $($c.Short)   $($c.Subject)")
+        }
         if ($state.Commits.Count -gt 0) {
             $txtBranch.Text = Make-BranchSuggestion $state.Commits
             $btnRun.Enabled = $true
             $btnDeleteCommit.Enabled = $true
+            $btnChangedFiles.Enabled = $true
             $lblCommitCount.Text = "처리할 커밋: $($state.Commits.Count)개"
         } else {
             $btnRun.Enabled = $false
             $btnDeleteCommit.Enabled = $false
+            $btnChangedFiles.Enabled = $false
             $lblCommitCount.Text = '처리할 커밋: 0개'
         }
         $btnCreateBranch.Enabled = $true
-        $btnMergeDevelop.Enabled = ($state.Branch -and $state.Branch -ne 'develop')
+        $btnMergeDevelop.Enabled = ($state.Branch -and $state.Branch -ne $state.BaseBranch -and $state.Branch -ne 'main')
+        $btnMergeDevelop.Tag = if ($btnMergeDevelop.Enabled) { 'Allowed' } else { 'Blocked' }
+        $btnChangedFiles.Enabled = (($script:VisibleCommits.Count -gt 0) -or ($script:VisiblePushedCommits.Count -gt 0))
     }
     catch {
+        $lblPushedCommits.Text = '내 Push 목록 (조회 실패)'
+        Sync-BaseBranchControl $script:LoadedRepoPath
         $lblStatus.Text = "확인 실패: $($_.Exception.Message)"
         $listCommits.Items.Clear()
+        $listPushedCommits.Items.Clear()
         $script:VisibleCommits = @()
+        $script:VisiblePushedCommits = @()
         $btnDeleteCommit.Enabled = $false
+        $btnChangedFiles.Enabled = $false
         $btnRun.Enabled = $false
         $btnCreateBranch.Enabled = $false
         $btnMergeDevelop.Enabled = $false
+        $btnMergeDevelop.Tag = 'Blocked'
     }
 }
 
 # ---------------- UI ----------------
+function Set-ModernButtonStyle($Button, [bool]$Primary = $false) {
+    $Button.FlatStyle = [System.Windows.Forms.FlatStyle]::Standard
+    $Button.UseVisualStyleBackColor = $true
+    $Button.Cursor = [System.Windows.Forms.Cursors]::Default
+    $Button.ForeColor = [System.Drawing.SystemColors]::ControlText
+}
+
 $form = New-Object System.Windows.Forms.Form
 $form.Text = $AppName
-$form.Size = New-Object System.Drawing.Size(860,820)
+$form.Size = New-Object System.Drawing.Size(860,987)
 $form.StartPosition = 'CenterScreen'
-$form.MinimumSize = New-Object System.Drawing.Size(860,820)
+$form.MinimumSize = New-Object System.Drawing.Size(860,987)
 $form.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::Dpi
 $form.Font = New-Object System.Drawing.Font('Malgun Gothic',10,[System.Drawing.FontStyle]::Regular,[System.Drawing.GraphicsUnit]::Point)
+$form.BackColor = [System.Drawing.SystemColors]::Control
+$form.ForeColor = [System.Drawing.SystemColors]::ControlText
 try { $form.Icon = [System.Drawing.Icon]::ExtractAssociatedIcon([Diagnostics.Process]::GetCurrentProcess().MainModule.FileName) } catch {}
 
 $lblTitle = New-Object System.Windows.Forms.Label
@@ -868,10 +1169,28 @@ $lblRepo.AutoSize = $true
 $lblRepo.Location = New-Object System.Drawing.Point(26,96)
 $form.Controls.Add($lblRepo)
 
-$txtRepo = New-Object System.Windows.Forms.TextBox
+$txtRepo = New-Object System.Windows.Forms.ComboBox
 $txtRepo.Location = New-Object System.Drawing.Point(28,120)
-$txtRepo.Size = New-Object System.Drawing.Size(650,28)
+$txtRepo.Size = New-Object System.Drawing.Size(420,28)
+$txtRepo.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDown
+$txtRepo.AutoCompleteMode = [System.Windows.Forms.AutoCompleteMode]::SuggestAppend
+$txtRepo.AutoCompleteSource = [System.Windows.Forms.AutoCompleteSource]::ListItems
+$txtRepo.FlatStyle = [System.Windows.Forms.FlatStyle]::Standard
+$txtRepo.BackColor = [System.Drawing.SystemColors]::Window
+$txtRepo.ForeColor = [System.Drawing.SystemColors]::WindowText
 $form.Controls.Add($txtRepo)
+
+$btnAddFavorite = New-Object System.Windows.Forms.Button
+$btnAddFavorite.Text = '+ 즐겨찾기'
+$btnAddFavorite.Location = New-Object System.Drawing.Point(458,118)
+$btnAddFavorite.Size = New-Object System.Drawing.Size(105,32)
+$form.Controls.Add($btnAddFavorite)
+
+$btnRemoveFavorite = New-Object System.Windows.Forms.Button
+$btnRemoveFavorite.Text = '− 제거'
+$btnRemoveFavorite.Location = New-Object System.Drawing.Point(573,118)
+$btnRemoveFavorite.Size = New-Object System.Drawing.Size(105,32)
+$form.Controls.Add($btnRemoveFavorite)
 
 $btnBrowse = New-Object System.Windows.Forms.Button
 $btnBrowse.Text = '변경...'
@@ -902,7 +1221,26 @@ $form.Controls.Add($lblCommitCount)
 $listCommits = New-Object System.Windows.Forms.ListBox
 $listCommits.Location = New-Object System.Drawing.Point(28,242)
 $listCommits.Size = New-Object System.Drawing.Size(782,120)
+$listCommits.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+$listCommits.BackColor = [System.Drawing.SystemColors]::Window
+$listCommits.ForeColor = [System.Drawing.SystemColors]::WindowText
 $form.Controls.Add($listCommits)
+
+$lblPushedCommits = New-Object System.Windows.Forms.Label
+$lblPushedCommits.Text = '내 Push 목록 (origin 반영 커밋)'
+$lblPushedCommits.AutoSize = $true
+$lblPushedCommits.Font = New-Object System.Drawing.Font('Malgun Gothic',10,[System.Drawing.FontStyle]::Bold)
+$lblPushedCommits.Location = New-Object System.Drawing.Point(28,382)
+$form.Controls.Add($lblPushedCommits)
+
+$listPushedCommits = New-Object System.Windows.Forms.ListBox
+$listPushedCommits.Location = New-Object System.Drawing.Point(28,409)
+$listPushedCommits.Size = New-Object System.Drawing.Size(782,120)
+$listPushedCommits.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+$listPushedCommits.BackColor = [System.Drawing.SystemColors]::Window
+$listPushedCommits.ForeColor = [System.Drawing.SystemColors]::WindowText
+$listPushedCommits.SelectionMode = [System.Windows.Forms.SelectionMode]::MultiExtended
+$form.Controls.Add($listPushedCommits)
 
 $btnDeleteCommit = New-Object System.Windows.Forms.Button
 $btnDeleteCommit.Text = '최근 커밋 되돌리기'
@@ -911,21 +1249,33 @@ $btnDeleteCommit.Size = New-Object System.Drawing.Size(200,32)
 $btnDeleteCommit.Enabled = $false
 $form.Controls.Add($btnDeleteCommit)
 
+$btnChangedFiles = New-Object System.Windows.Forms.Button
+$btnChangedFiles.Text = '변경 파일 보기'
+$btnChangedFiles.Location = New-Object System.Drawing.Point(400,204)
+$btnChangedFiles.Size = New-Object System.Drawing.Size(190,32)
+$btnChangedFiles.Enabled = $false
+$form.Controls.Add($btnChangedFiles)
+
 $lblBranch = New-Object System.Windows.Forms.Label
 $lblBranch.Text = 'Feature branch 이름'
 $lblBranch.AutoSize = $true
-$lblBranch.Location = New-Object System.Drawing.Point(28,382)
+$lblBranch.Location = New-Object System.Drawing.Point(28,549)
 $form.Controls.Add($lblBranch)
 
 $txtBranch = New-Object System.Windows.Forms.TextBox
-$txtBranch.Location = New-Object System.Drawing.Point(28,406)
+$txtBranch.Location = New-Object System.Drawing.Point(28,573)
 $txtBranch.Size = New-Object System.Drawing.Size(500,28)
+$txtBranch.BackColor = [System.Drawing.SystemColors]::Window
+$txtBranch.ForeColor = [System.Drawing.SystemColors]::WindowText
+$txtBranch.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
 $form.Controls.Add($txtBranch)
 
 $groupAfter = New-Object System.Windows.Forms.GroupBox
 $groupAfter.Text = '머지 후 feature 브랜치'
-$groupAfter.Location = New-Object System.Drawing.Point(550,382)
+$groupAfter.Location = New-Object System.Drawing.Point(550,549)
 $groupAfter.Size = New-Object System.Drawing.Size(260,78)
+$groupAfter.BackColor = [System.Drawing.SystemColors]::Control
+$groupAfter.ForeColor = [System.Drawing.SystemColors]::ControlText
 $form.Controls.Add($groupAfter)
 
 $radioDelete = New-Object System.Windows.Forms.RadioButton
@@ -944,49 +1294,147 @@ $groupAfter.Controls.Add($radioKeep)
 $btnRun = New-Object System.Windows.Forms.Button
 $btnRun.Text = 'Develop에 반영'
 $btnRun.Font = New-Object System.Drawing.Font('Malgun Gothic',11,[System.Drawing.FontStyle]::Bold)
-$btnRun.Location = New-Object System.Drawing.Point(28,455)
+$btnRun.Location = New-Object System.Drawing.Point(28,622)
 $btnRun.Size = New-Object System.Drawing.Size(500,42)
 $btnRun.Enabled = $false
 $form.Controls.Add($btnRun)
 
 $btnCreateBranch = New-Object System.Windows.Forms.Button
 $btnCreateBranch.Text = '현재 커밋에서 브랜치 생성'
-$btnCreateBranch.Location = New-Object System.Drawing.Point(28,510)
+$btnCreateBranch.Location = New-Object System.Drawing.Point(28,677)
 $btnCreateBranch.Size = New-Object System.Drawing.Size(245,42)
 $btnCreateBranch.Enabled = $false
 $form.Controls.Add($btnCreateBranch)
 
 $btnMergeDevelop = New-Object System.Windows.Forms.Button
-$btnMergeDevelop.Text = '현재 브랜치를 develop에 병합'
-$btnMergeDevelop.Location = New-Object System.Drawing.Point(283,510)
+$btnMergeDevelop.Text = '현재 브랜치를 기본 브랜치에 병합'
+$btnMergeDevelop.Location = New-Object System.Drawing.Point(283,677)
 $btnMergeDevelop.Size = New-Object System.Drawing.Size(527,42)
 $btnMergeDevelop.Enabled = $false
+$btnMergeDevelop.Tag = 'Blocked'
 $form.Controls.Add($btnMergeDevelop)
 
 $btnUpdate = New-Object System.Windows.Forms.Button
 $btnUpdate.Text = '업데이트 확인'
-$btnUpdate.Location = New-Object System.Drawing.Point(265,20)
-$btnUpdate.Size = New-Object System.Drawing.Size(115,28)
-$btnUpdate.Font = New-Object System.Drawing.Font('Malgun Gothic',8,[System.Drawing.FontStyle]::Regular)
+$btnUpdate.Location = New-Object System.Drawing.Point(260,18)
+$btnUpdate.Size = New-Object System.Drawing.Size(150,34)
+$btnUpdate.Font = New-Object System.Drawing.Font('Malgun Gothic',9,[System.Drawing.FontStyle]::Regular)
 $form.Controls.Add($btnUpdate)
+
+$lblBaseBranch = New-Object System.Windows.Forms.Label
+$lblBaseBranch.Text = '기본 브랜치'
+$lblBaseBranch.AutoSize = $true
+$lblBaseBranch.Location = New-Object System.Drawing.Point(430,24)
+$form.Controls.Add($lblBaseBranch)
+
+$cmbBaseBranch = New-Object System.Windows.Forms.ComboBox
+$cmbBaseBranch.Location = New-Object System.Drawing.Point(530,19)
+$cmbBaseBranch.Size = New-Object System.Drawing.Size(280,28)
+$cmbBaseBranch.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
+$form.Controls.Add($cmbBaseBranch)
 
 $lblLog = New-Object System.Windows.Forms.Label
 $lblLog.Text = '진행 로그'
 $lblLog.AutoSize = $true
-$lblLog.Location = New-Object System.Drawing.Point(28,575)
+$lblLog.Location = New-Object System.Drawing.Point(28,742)
 $form.Controls.Add($lblLog)
 
 $txtLog = New-Object System.Windows.Forms.TextBox
-$txtLog.Location = New-Object System.Drawing.Point(28,600)
+$txtLog.Location = New-Object System.Drawing.Point(28,767)
 $txtLog.Size = New-Object System.Drawing.Size(782,150)
 $txtLog.Multiline = $true
 $txtLog.ScrollBars = 'Vertical'
 $txtLog.ReadOnly = $true
+$txtLog.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+$txtLog.BackColor = [System.Drawing.SystemColors]::Window
+$txtLog.ForeColor = [System.Drawing.SystemColors]::WindowText
 $form.Controls.Add($txtLog)
+
+# Keep the fixed controls aligned while sharing additional window height between
+# the commit list and the log.  This makes both areas show more rows when the
+# user enlarges the window instead of leaving unused space at the bottom.
+$layoutBaseClientSize = $null
+$layoutBaseBounds = @{}
+$layoutControls = @(
+    $txtRepo,$btnAddFavorite,$btnRemoveFavorite,$btnBrowse,$btnRefresh,$lblStatus,
+    $lblCommitCount,$listCommits,$btnDeleteCommit,$btnChangedFiles,$lblBranch,
+    $lblPushedCommits,$listPushedCommits,$txtBranch,$groupAfter,$btnRun,$btnCreateBranch,$btnMergeDevelop,$lblLog,$txtLog
+)
+
+function Initialize-MainWindowLayout {
+    $script:layoutBaseClientSize = $form.ClientSize
+    $script:layoutBaseBounds.Clear()
+    foreach ($control in $layoutControls) {
+        $script:layoutBaseBounds[$control.Name + ':' + $control.GetHashCode()] = $control.Bounds
+    }
+    Update-TopControlsLayout
+}
+
+function Get-LayoutBaseBounds($Control) {
+    return $layoutBaseBounds[$Control.Name + ':' + $Control.GetHashCode()]
+}
+
+function Set-ControlBounds($Control, [int]$X, [int]$Y, [int]$Width, [int]$Height) {
+    $Control.Bounds = New-Object System.Drawing.Rectangle($X,$Y,[Math]::Max(1,$Width),[Math]::Max(1,$Height))
+}
+
+function Update-TopControlsLayout {
+    # Use the controls' actual scaled bounds instead of fixed coordinates so
+    # high-DPI text never overlaps or clips the controls that follow it.
+    $gap = 14
+    $btnUpdate.Left = $lblTitle.Right + $gap
+    $lblBaseBranch.Left = $btnUpdate.Right + $gap
+    $lblBaseBranch.Top = $btnUpdate.Top + [int](($btnUpdate.Height - $lblBaseBranch.Height) / 2)
+    $cmbBaseBranch.Left = $lblBaseBranch.Right + $gap
+    $availableWidth = $form.ClientSize.Width - $cmbBaseBranch.Left - 34
+    $cmbBaseBranch.Width = [Math]::Max(160, $availableWidth)
+    if ($cmbBaseBranch.DropDownWidth -lt $cmbBaseBranch.Width) { $cmbBaseBranch.DropDownWidth = $cmbBaseBranch.Width }
+}
+
+function Update-MainWindowLayout {
+    if ($null -eq $layoutBaseClientSize) { return }
+    Update-TopControlsLayout
+    $widthDelta = [Math]::Max(0, $form.ClientSize.Width - $layoutBaseClientSize.Width)
+    $heightDelta = [Math]::Max(0, $form.ClientSize.Height - $layoutBaseClientSize.Height)
+    $commitGrowth = [int][Math]::Floor($heightDelta / 3)
+    $pushedGrowth = [int][Math]::Floor($heightDelta / 3)
+    $logGrowth = $heightDelta - $commitGrowth - $pushedGrowth
+    $lowerShift = $commitGrowth + $pushedGrowth
+
+    foreach ($control in @($txtRepo,$lblStatus,$listCommits,$listPushedCommits,$txtLog)) {
+        $base = Get-LayoutBaseBounds $control
+        $height = if ($control -eq $listCommits) { $base.Height + $commitGrowth } elseif ($control -eq $listPushedCommits) { $base.Height + $pushedGrowth } elseif ($control -eq $txtLog) { $base.Height + $logGrowth } else { $base.Height }
+        $y = if ($control -eq $listPushedCommits) { $base.Y + $commitGrowth } elseif ($control -eq $txtLog) { $base.Y + $lowerShift } else { $base.Y }
+        Set-ControlBounds $control $base.X $y ($base.Width + $widthDelta) $height
+    }
+
+    foreach ($control in @($btnAddFavorite,$btnRemoveFavorite,$btnBrowse,$btnRefresh,$btnDeleteCommit,$btnChangedFiles,$groupAfter)) {
+        $base = Get-LayoutBaseBounds $control
+        Set-ControlBounds $control ($base.X + $widthDelta) ($base.Y + $(if ($control -in @($groupAfter)) { $lowerShift } else { 0 })) $base.Width $base.Height
+    }
+
+    $pushedLabelBase = Get-LayoutBaseBounds $lblPushedCommits
+    Set-ControlBounds $lblPushedCommits $pushedLabelBase.X ($pushedLabelBase.Y + $commitGrowth) $pushedLabelBase.Width $pushedLabelBase.Height
+
+    foreach ($control in @($lblBranch,$txtBranch,$btnRun,$btnCreateBranch,$btnMergeDevelop,$lblLog)) {
+        $base = Get-LayoutBaseBounds $control
+        $newWidth = $base.Width
+        if ($control -in @($txtBranch,$btnRun,$btnMergeDevelop)) { $newWidth += $widthDelta }
+        Set-ControlBounds $control $base.X ($base.Y + $lowerShift) $newWidth $base.Height
+    }
+}
+
+$form.Add_Resize({ Update-MainWindowLayout })
+
+Set-ModernButtonStyle $btnRun $true
+Set-ModernButtonStyle $btnMergeDevelop $true
+foreach ($button in @($btnBrowse,$btnRefresh,$btnDeleteCommit,$btnChangedFiles,$btnCreateBranch,$btnUpdate,$btnAddFavorite,$btnRemoveFavorite)) {
+    Set-ModernButtonStyle $button $false
+}
 
 $btnBrowse.Add_Click({
     $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
-    $dlg.Description = 'cqi_client Git 저장소 폴더를 선택하세요.'
+    $dlg.Description = 'Git 저장소 폴더를 선택하세요.'
     if ($txtRepo.Text -and (Test-Path $txtRepo.Text)) { $dlg.SelectedPath = $txtRepo.Text }
     if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
         $txtRepo.Text = $dlg.SelectedPath
@@ -996,20 +1444,57 @@ $btnBrowse.Add_Click({
 })
 
 $btnRefresh.Add_Click({ Refresh-View })
+$btnAddFavorite.Add_Click({ Add-CurrentRepoFavorite })
+$btnRemoveFavorite.Add_Click({ Remove-CurrentRepoFavorite })
+$txtRepo.Add_SelectionChangeCommitted({
+    if (-not $script:LoadingRepoList -and $txtRepo.SelectedItem) {
+        $txtRepo.Text = [string]$txtRepo.SelectedItem
+        Save-Config $txtRepo.Text
+        Refresh-View
+    }
+})
+$txtRepo.Add_TextChanged({
+    if (-not $script:LoadingRepoList -and $txtRepo.Text.Trim() -ne $script:LoadedRepoPath) {
+        $listPushedCommits.Items.Clear()
+        $script:VisiblePushedCommits = @()
+    }
+})
+$txtRepo.Add_KeyDown({
+    param($sender,$eventArgs)
+    if ($eventArgs.KeyCode -eq [System.Windows.Forms.Keys]::Enter) {
+        Refresh-View
+        $eventArgs.SuppressKeyPress = $true
+    }
+})
+$txtRepo.Add_Leave({
+    $enteredPath = $txtRepo.Text.Trim()
+    if ($enteredPath -and $enteredPath -ne $script:LoadedRepoPath) { Refresh-View }
+})
 $btnRun.Add_Click({ Run-Workflow })
 $btnDeleteCommit.Add_Click({ Undo-LastCommit })
+$btnChangedFiles.Add_Click({ Show-SelectedChangedFiles })
+$listPushedCommits.Add_SelectedIndexChanged({ if ($listPushedCommits.SelectedIndices.Count -gt 0) { $listCommits.ClearSelected() } })
+$listCommits.Add_SelectedIndexChanged({ if ($listCommits.SelectedIndices.Count -gt 0) { $listPushedCommits.ClearSelected() } })
 $btnCreateBranch.Add_Click({ New-BranchAtHead })
 $btnMergeDevelop.Add_Click({ Merge-CurrentBranchToDevelop })
 $btnUpdate.Add_Click({ Check-ForUpdate $true })
+$cmbBaseBranch.Add_SelectionChangeCommitted({
+    if (-not $script:LoadingBaseBranch -and $script:LoadedRepoPath -and $cmbBaseBranch.SelectedItem) {
+        $script:BaseBranches[$script:LoadedRepoPath] = [string]$cmbBaseBranch.SelectedItem
+        Save-Config $script:LoadedRepoPath
+        Refresh-View
+    }
+})
 
 $savedRepo = Load-Config
 if ($savedRepo -and (Test-Path $savedRepo)) {
-    $txtRepo.Text = $savedRepo
+    Sync-FavoriteRepoControl $savedRepo
 } else {
-    $txtRepo.Text = (Get-Location).Path
+    Sync-FavoriteRepoControl (Get-Location).Path
 }
 
 $form.Add_Shown({
+    Initialize-MainWindowLayout
     Refresh-View
     $form.BeginInvoke([Action]{ Check-ForUpdate $false }) | Out-Null
 })
