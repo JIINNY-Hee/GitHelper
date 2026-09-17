@@ -202,7 +202,7 @@ PowerShell에서 `ps2exe` 모듈을 설치한 다음 빌드합니다.
 
 ```powershell
 Install-Module ps2exe -Scope CurrentUser
-.\Source\Build-Release.ps1 -Version 1.0.3
+.\Source\Build-Release.ps1 -Version 1.0.4
 ```
 
 결과물은 `EXE/GitHelper.exe`와 `EXE/GitHelper.zip`에 생성됩니다. 버전별 변경사항은 [CHANGELOG.md](CHANGELOG.md)를 참고하세요.
