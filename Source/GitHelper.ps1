@@ -17,8 +17,8 @@ $env:LANG = 'ko_KR.UTF-8'
 $env:LC_ALL = 'ko_KR.UTF-8'
 
 
-$AppName = 'GitHelper v1.0.3'
-$AppVersion = [version]'1.0.3'
+$AppName = 'GitHelper v1.0.4'
+$AppVersion = [version]'1.0.4'
 $GitHubRepo = 'JIINNY-Hee/GitHelper'
 $ConfigDir = Join-Path $env:APPDATA 'GitHelper'
 $ConfigPath = Join-Path $ConfigDir 'config.json'
@@ -1394,7 +1394,7 @@ $form.ForeColor = [System.Drawing.SystemColors]::ControlText
 try { $form.Icon = [System.Drawing.Icon]::ExtractAssociatedIcon([Diagnostics.Process]::GetCurrentProcess().MainModule.FileName) } catch {}
 
 $lblTitle = New-Object System.Windows.Forms.Label
-$lblTitle.Text = 'GitHelper v1.0.3'
+$lblTitle.Text = 'GitHelper v1.0.4'
 $lblTitle.Font = New-Object System.Drawing.Font('Malgun Gothic',18,[System.Drawing.FontStyle]::Bold)
 $lblTitle.AutoSize = $true
 $lblTitle.Location = New-Object System.Drawing.Point(24,18)
