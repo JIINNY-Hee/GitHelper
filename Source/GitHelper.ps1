@@ -787,6 +787,74 @@ function Merge-CurrentBranchToDevelop {
     finally { Set-Busy $false; Refresh-View }
 }
 
+function Show-UpdateDialog([version]$LatestVersion, [string]$ChangeLog) {
+    $dialog = New-Object System.Windows.Forms.Form
+    $dialog.Text = 'GitHelper 업데이트'
+    $dialog.Size = New-Object System.Drawing.Size(720,600)
+    $dialog.MinimumSize = New-Object System.Drawing.Size(560,420)
+    $dialog.MaximumSize = New-Object System.Drawing.Size(900,720)
+    $dialog.StartPosition = 'CenterParent'
+    $dialog.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::Sizable
+    $dialog.MaximizeBox = $false
+    $dialog.MinimizeBox = $false
+    $dialog.ShowIcon = $false
+    $dialog.Font = $form.Font
+
+    $layout = New-Object System.Windows.Forms.TableLayoutPanel
+    $layout.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $layout.ColumnCount = 1
+    $layout.RowCount = 3
+    $layout.Padding = New-Object System.Windows.Forms.Padding(16,10,16,10)
+    [void]$layout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute,48)))
+    [void]$layout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent,100)))
+    [void]$layout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute,54)))
+    $dialog.Controls.Add($layout)
+
+    $header = New-Object System.Windows.Forms.Label
+    $header.Text = "새 버전 v$LatestVersion이 있습니다. (현재 v$AppVersion)"
+    $header.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $header.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
+    $header.Font = New-Object System.Drawing.Font($dialog.Font, [System.Drawing.FontStyle]::Bold)
+    $layout.Controls.Add($header,0,0)
+
+    $buttonPanel = New-Object System.Windows.Forms.FlowLayoutPanel
+    $buttonPanel.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $buttonPanel.FlowDirection = [System.Windows.Forms.FlowDirection]::RightToLeft
+    $buttonPanel.WrapContents = $false
+    $buttonPanel.Padding = New-Object System.Windows.Forms.Padding(0,10,0,0)
+
+    $laterButton = New-Object System.Windows.Forms.Button
+    $laterButton.Text = '나중에'
+    $laterButton.DialogResult = [System.Windows.Forms.DialogResult]::No
+    $laterButton.Size = New-Object System.Drawing.Size(96,34)
+    $buttonPanel.Controls.Add($laterButton)
+
+    $updateButton = New-Object System.Windows.Forms.Button
+    $updateButton.Text = '업데이트'
+    $updateButton.DialogResult = [System.Windows.Forms.DialogResult]::Yes
+    $updateButton.Size = New-Object System.Drawing.Size(96,34)
+    $buttonPanel.Controls.Add($updateButton)
+    $layout.Controls.Add($buttonPanel,0,2)
+
+    $changeLogBox = New-Object System.Windows.Forms.RichTextBox
+    $changeLogBox.ReadOnly = $true
+    $changeLogBox.WordWrap = $true
+    $changeLogBox.ScrollBars = [System.Windows.Forms.RichTextBoxScrollBars]::Vertical
+    $changeLogBox.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $changeLogBox.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+    $changeLogBox.BackColor = [System.Drawing.SystemColors]::Window
+    $changeLogBox.Text = "[ChangeLog]`r`n`r`n$ChangeLog"
+    $changeLogBox.Margin = New-Object System.Windows.Forms.Padding(0)
+    $layout.Controls.Add($changeLogBox,0,1)
+
+    $dialog.AcceptButton = $updateButton
+    $dialog.CancelButton = $laterButton
+    try {
+        $dialog.ActiveControl = $updateButton
+        return $dialog.ShowDialog($form)
+    } finally { $dialog.Dispose() }
+}
+
 function Check-ForUpdate([bool]$Manual = $false) {
     try {
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -800,7 +868,7 @@ function Check-ForUpdate([bool]$Manual = $false) {
         }
 
         $changeLog = if ($release.body) { [string]$release.body } else { '변경 내역이 제공되지 않았습니다.' }
-        $answer = [System.Windows.Forms.MessageBox]::Show("새 버전 v$latest이 있습니다. (현재 v$AppVersion)`r`n`r`n[ChangeLog]`r`n$changeLog`r`n`r`n지금 업데이트할까요?", 'GitHelper 업데이트', 'YesNo', 'Information')
+        $answer = Show-UpdateDialog -LatestVersion $latest -ChangeLog $changeLog
         if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) { return }
 
         $asset = @($release.assets | Where-Object { $_.name -eq 'GitHelper.exe' } | Select-Object -First 1)
