@@ -34,7 +34,11 @@ GitHelper는 Windows에서 로컬 커밋을 작업 브랜치와 PR로 옮겨 기
 - 원격 저장소의 Push 및 PR 생성 권한
 - GitHub CLI(`gh`)
 
+Git이 없으면 프로그램 시작 시 `winget`으로 Git for Windows를 자동 설치합니다. Git이 설치되어 있지만 PATH에 없으면 일반 설치 위치를 찾아 사용자 PATH에 자동 등록합니다.
+
 GitHub CLI가 없으면 필요한 시점에 `winget` 설치를 안내합니다. GitHub 로그인이 필요하면 브라우저 인증 화면을 열고 인증 완료 후 계속합니다.
+
+GitHub CLI에 여러 계정이 로그인되어 있으면 현재 `origin` 저장소에 push 권한이 있는 계정을 자동으로 확인합니다. 사용할 수 있는 계정이 하나면 자동 전환하고, 여러 개면 작업 전에 선택창을 표시합니다.
 
 내 Push 목록을 구분하려면 Git 사용자 이메일도 설정되어 있어야 합니다.
 
@@ -198,7 +202,7 @@ PowerShell에서 `ps2exe` 모듈을 설치한 다음 빌드합니다.
 
 ```powershell
 Install-Module ps2exe -Scope CurrentUser
-.\Source\Build-Release.ps1 -Version 1.0.2
+.\Source\Build-Release.ps1 -Version 1.0.3
 ```
 
 결과물은 `EXE/GitHelper.exe`와 `EXE/GitHelper.zip`에 생성됩니다. 버전별 변경사항은 [CHANGELOG.md](CHANGELOG.md)를 참고하세요.
