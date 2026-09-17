@@ -110,6 +110,7 @@ $script:LoadedRepoPath = $null
 $script:BaseBranches = @{}
 $script:AvailableBaseBranches = @()
 $script:LoadingBaseBranch = $false
+$script:GitExePath = 'git.exe'
 
 function Invoke-Git {
     param([Parameter(Mandatory=$true)][string[]]$GitArgs)
@@ -124,7 +125,7 @@ function Invoke-Git {
         '-c', 'core.quotepath=false'
     ) + $GitArgs
 
-    return Invoke-ProcessText -FilePath 'git.exe' -Arguments $effectiveArgs -WorkingDirectory $script:CurrentRepo
+    return Invoke-ProcessText -FilePath $script:GitExePath -Arguments $effectiveArgs -WorkingDirectory $script:CurrentRepo
 }
 
 function Invoke-Gh {
@@ -207,6 +208,81 @@ function Test-CommandAvailable([string]$Name) {
     return $null -ne (Get-Command $Name -ErrorAction SilentlyContinue)
 }
 
+function Update-ProcessPath {
+    $machinePath = [Environment]::GetEnvironmentVariable('Path','Machine')
+    $userPath = [Environment]::GetEnvironmentVariable('Path','User')
+    $env:Path = (@($machinePath, $userPath) | Where-Object { $_ }) -join ';'
+}
+
+function Find-GitExecutable {
+    $command = Get-Command 'git.exe' -ErrorAction SilentlyContinue
+    if ($command -and $command.Source -and (Test-Path -LiteralPath $command.Source)) {
+        return $command.Source
+    }
+
+    $candidates = @(
+        (Join-Path $env:ProgramFiles 'Git\cmd\git.exe'),
+        $(if (${env:ProgramFiles(x86)}) { Join-Path ${env:ProgramFiles(x86)} 'Git\cmd\git.exe' }),
+        $(if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA 'Programs\Git\cmd\git.exe' })
+    ) | Where-Object { $_ }
+
+    return $candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+}
+
+function Add-GitToUserPath([string]$GitExePath) {
+    $gitDir = Split-Path -Parent $GitExePath
+    $userPath = [Environment]::GetEnvironmentVariable('Path','User')
+    $entries = @($userPath -split ';' | Where-Object { $_ })
+    if ($entries -notcontains $gitDir) {
+        $newUserPath = (@($entries) + $gitDir) -join ';'
+        [Environment]::SetEnvironmentVariable('Path', $newUserPath, 'User')
+    }
+    Update-ProcessPath
+}
+
+function Ensure-Git {
+    Update-ProcessPath
+    $gitExe = Find-GitExecutable
+    if ($gitExe) {
+        try { Add-GitToUserPath $gitExe } catch {
+            # The absolute path still lets this process use Git even if PATH persistence fails.
+        }
+        $script:GitExePath = $gitExe
+        return $true
+    }
+
+    if (-not (Test-CommandAvailable 'winget.exe')) {
+        Show-Error "Git이 설치되어 있지 않고 winget도 찾을 수 없어 자동 설치할 수 없습니다.`r`n`r`nhttps://git-scm.com/download/win 에서 Git for Windows를 설치해 주세요."
+        return $false
+    }
+
+    Append-Log 'Git for Windows를 자동 설치합니다...'
+    $install = Invoke-ProcessText -FilePath 'winget.exe' -Arguments @(
+        'install','--id','Git.Git','-e','--silent',
+        '--accept-package-agreements','--accept-source-agreements'
+    )
+    if ($install.ExitCode -ne 0) {
+        $detail = if ($install.StdErr) { $install.StdErr } else { $install.StdOut }
+        Show-Error "Git for Windows 자동 설치에 실패했습니다.`r`n`r`n$detail`r`n`r`nhttps://git-scm.com/download/win 에서 직접 설치해 주세요."
+        return $false
+    }
+
+    Update-ProcessPath
+    $gitExe = Find-GitExecutable
+    if (-not $gitExe) {
+        Show-Error 'Git 설치는 완료되었지만 git.exe를 찾지 못했습니다. Windows에 다시 로그인한 뒤 실행해 주세요.'
+        return $false
+    }
+
+    try { Add-GitToUserPath $gitExe } catch {
+        Show-Error "Git은 설치되었지만 사용자 PATH 등록에 실패했습니다.`r`n`r`n$($_.Exception.Message)"
+        return $false
+    }
+    $script:GitExePath = $gitExe
+    Append-Log "Git 준비 완료: $gitExe"
+    return $true
+}
+
 function Ensure-GitHubCli {
     if (Test-CommandAvailable 'gh') { return $true }
 
@@ -233,32 +309,130 @@ function Ensure-GitHubCli {
     return (Test-CommandAvailable 'gh')
 }
 
-function Ensure-GitHubHttpsAuth {
+function Get-GitHubRepoName {
+    $origin = Invoke-Git -GitArgs @('remote','get-url','origin')
+    if ($origin.ExitCode -ne 0) { return $null }
+    if ($origin.StdOut -match '(?i)github\.com[/:](?<owner>[^/\s:]+)/(?<repo>[^/\s]+?)(?:\.git)?$') {
+        return "$($Matches.owner)/$($Matches.repo)"
+    }
+    return $null
+}
+
+function Select-GitHubAccount([string[]]$Accounts, [string]$RepoName, [string]$PreferredAccount) {
+    $dialog = New-Object System.Windows.Forms.Form
+    $dialog.Text = 'GitHub 계정 선택'
+    $dialog.Size = New-Object System.Drawing.Size(440,205)
+    $dialog.StartPosition = 'CenterParent'
+    $dialog.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
+    $dialog.MaximizeBox = $false
+    $dialog.MinimizeBox = $false
+    $dialog.Font = $form.Font
+
+    $label = New-Object System.Windows.Forms.Label
+    $label.Text = "저장소 '$RepoName'에 사용할 GitHub 계정을 선택하세요."
+    $label.AutoSize = $true
+    $label.Location = New-Object System.Drawing.Point(18,18)
+    $dialog.Controls.Add($label)
+
+    $combo = New-Object System.Windows.Forms.ComboBox
+    $combo.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
+    $combo.Location = New-Object System.Drawing.Point(20,55)
+    $combo.Size = New-Object System.Drawing.Size(382,28)
+    foreach ($account in $Accounts) { [void]$combo.Items.Add($account) }
+    $preferredIndex = if ($PreferredAccount) { $combo.Items.IndexOf($PreferredAccount) } else { -1 }
+    $combo.SelectedIndex = if ($preferredIndex -ge 0) { $preferredIndex } else { 0 }
+    $dialog.Controls.Add($combo)
+
+    $ok = New-Object System.Windows.Forms.Button
+    $ok.Text = '선택'
+    $ok.DialogResult = [System.Windows.Forms.DialogResult]::OK
+    $ok.Location = New-Object System.Drawing.Point(226,108)
+    $ok.Size = New-Object System.Drawing.Size(82,32)
+    $dialog.Controls.Add($ok)
+
+    $cancel = New-Object System.Windows.Forms.Button
+    $cancel.Text = '취소'
+    $cancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $cancel.Location = New-Object System.Drawing.Point(320,108)
+    $cancel.Size = New-Object System.Drawing.Size(82,32)
+    $dialog.Controls.Add($cancel)
+    $dialog.AcceptButton = $ok
+    $dialog.CancelButton = $cancel
+
+    try {
+        if ($dialog.ShowDialog($form) -eq [System.Windows.Forms.DialogResult]::OK) {
+            return [string]$combo.SelectedItem
+        }
+        return $null
+    } finally { $dialog.Dispose() }
+}
+
+function Start-GitHubLogin {
+    $msg = "이 저장소에 사용할 수 있는 GitHub 계정이 없습니다.`r`n`r`n[예]를 누르면 새 계정 로그인 창을 엽니다."
+    $answer = [System.Windows.Forms.MessageBox]::Show($msg, $AppName, 'YesNo', 'Question')
+    if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) { return $false }
+
+    $ghCommand = Get-Command 'gh.exe' -ErrorAction SilentlyContinue
+    if (-not $ghCommand) { return $false }
+    Append-Log 'GitHub 로그인 창을 엽니다...'
+    $proc = Start-Process -FilePath $ghCommand.Source -ArgumentList @('auth','login','--hostname','github.com','--git-protocol','https','--web') -Wait -PassThru
+    return ($proc.ExitCode -eq 0)
+}
+
+function Ensure-GitHubHttpsAuth([switch]$LoginAttempted) {
     if (-not (Ensure-GitHubCli)) { return $false }
 
-    $auth = Invoke-Gh -GhArgs @('auth','status','--hostname','github.com')
-    if ($auth.ExitCode -ne 0) {
-        $msg = "GitHub 로그인이 필요합니다.`r`n`r`n[예]를 누르면 GitHub 로그인 창을 열고, 로그인 완료 후 자동으로 계속합니다."
-        $answer = [System.Windows.Forms.MessageBox]::Show($msg, $AppName, 'YesNo', 'Question')
-        if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) { return $false }
+    $status = Invoke-Gh -GhArgs @('auth','status','--hostname','github.com','--json','hosts')
+    $accounts = @()
+    $activeAccount = $null
+    if ($status.ExitCode -eq 0 -and $status.StdOut) {
+        try {
+            $statusJson = $status.StdOut | ConvertFrom-Json
+            $hostAccounts = @($statusJson.hosts.'github.com')
+            $accounts = @($hostAccounts | ForEach-Object { $_.login } | Where-Object { $_ } | Select-Object -Unique)
+            $activeAccount = [string]($hostAccounts | Where-Object { $_.active } | Select-Object -First 1 -ExpandProperty login)
+        } catch { $accounts = @() }
+    }
 
-        Append-Log 'GitHub 로그인 창을 엽니다...'
-        $loginCommand = 'gh auth login --hostname github.com --git-protocol https --web'
-        $proc = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-Command',$loginCommand) -Wait -PassThru
-        if ($proc.ExitCode -ne 0) {
-            Show-Error 'GitHub 로그인이 완료되지 않았습니다.'
-            return $false
-        }
-
-        $auth = Invoke-Gh -GhArgs @('auth','status','--hostname','github.com')
-        if ($auth.ExitCode -ne 0) {
-            Show-Error 'GitHub 로그인 상태를 확인하지 못했습니다.'
-            return $false
+    $repoName = Get-GitHubRepoName
+    if (-not $repoName) {
+        Show-Error 'origin 주소에서 GitHub 저장소 이름을 확인하지 못했습니다. github.com의 HTTPS 또는 SSH 저장소 주소인지 확인해 주세요.'
+        return $false
+    }
+    $validAccounts = @()
+    foreach ($account in $accounts) {
+        $switch = Invoke-Gh -GhArgs @('auth','switch','--hostname','github.com','--user',$account)
+        if ($switch.ExitCode -ne 0) { continue }
+        $permission = Invoke-Gh -GhArgs @('api',"repos/$repoName",'--jq','.permissions.push')
+        if ($permission.ExitCode -eq 0 -and $permission.StdOut.Trim().ToLowerInvariant() -eq 'true') {
+            $validAccounts += $account
         }
     }
 
-    Append-Log 'GitHub 자격 증명을 Git에 연결합니다...'
-    $setup = Invoke-Gh -GhArgs @('auth','setup-git')
+    if ($validAccounts.Count -eq 0) {
+        if ($activeAccount) { [void](Invoke-Gh -GhArgs @('auth','switch','--hostname','github.com','--user',$activeAccount)) }
+        if (-not $LoginAttempted -and (Start-GitHubLogin)) {
+            return Ensure-GitHubHttpsAuth -LoginAttempted
+        }
+        Show-Error "저장소 '$repoName'에 접근 가능한 GitHub 계정을 찾지 못했습니다.`r`n`r`n로그인 계정에 저장소 push 권한이 있는지 확인해 주세요."
+        return $false
+    }
+
+    $selectedAccount = if ($validAccounts.Count -eq 1) {
+        $validAccounts[0]
+    } else {
+        Select-GitHubAccount -Accounts $validAccounts -RepoName $repoName -PreferredAccount $activeAccount
+    }
+    if (-not $selectedAccount) { return $false }
+
+    $switch = Invoke-Gh -GhArgs @('auth','switch','--hostname','github.com','--user',$selectedAccount)
+    if ($switch.ExitCode -ne 0) {
+        Show-Error "GitHub 계정을 '$selectedAccount'(으)로 전환하지 못했습니다.`r`n`r`n$($switch.StdErr)"
+        return $false
+    }
+    Append-Log "GitHub 계정 선택 완료: $selectedAccount ($repoName)"
+
+    $setup = Invoke-Gh -GhArgs @('auth','setup-git','--hostname','github.com')
     if ($setup.ExitCode -ne 0) {
         Show-Error "Git 자격 증명 연결에 실패했습니다.`r`n`r`n$($setup.StdErr)"
         return $false
@@ -543,11 +717,12 @@ function Merge-CurrentBranchToDevelop {
             Append-Log "미커밋 파일 보관 완료: $($stashHash.Substring(0,8))"
         }
 
+        if (-not (Ensure-GitHubHttpsAuth)) { throw 'GitHub 인증을 완료하지 못했습니다.' }
+
         Append-Log "현재 브랜치를 origin에 push합니다: $sourceBranch"
         $push = Invoke-Git -GitArgs @('push','-u','origin',$sourceBranch)
         if ($push.ExitCode -ne 0) { throw "현재 브랜치 push 실패:`r`n$($push.StdErr)" }
 
-        if (-not (Ensure-GitHubHttpsAuth)) { throw 'GitHub 인증을 완료하지 못했습니다.' }
         $title = if ($state.Commits.Count -gt 0) { $state.Commits[-1].Subject } else { "Merge $sourceBranch into develop" }
         $body = "GitHelper에서 현재 브랜치 '$sourceBranch'를 $baseBranch에 병합하기 위해 생성한 PR입니다."
 
@@ -963,6 +1138,8 @@ function Run-Workflow {
             }
         }
 
+        if (-not (Ensure-GitHubHttpsAuth)) { throw 'GitHub 인증을 완료하지 못했습니다.' }
+
         Append-Log 'feature 브랜치를 origin에 push 합니다...'
         $push = Invoke-Git -GitArgs @('push','-u','origin',$feature)
         if ($push.ExitCode -ne 0) {
@@ -974,8 +1151,6 @@ function Run-Workflow {
             if ($push.ExitCode -ne 0) { throw "feature push 실패:`r`n$($push.StdErr)" }
         }
         $featurePushed = $true
-
-        if (-not (Ensure-GitHubHttpsAuth)) { throw 'GitHub 인증을 완료하지 못했습니다. feature push까지는 완료했습니다.' }
 
         $title = $state.Commits[-1].Subject
         if ($state.Commits.Count -gt 1) { $title = "$title 외 $($state.Commits.Count - 1)건" }
@@ -1495,7 +1670,11 @@ if ($savedRepo -and (Test-Path $savedRepo)) {
 
 $form.Add_Shown({
     Initialize-MainWindowLayout
-    Refresh-View
+    if (Ensure-Git) {
+        Refresh-View
+    } else {
+        $lblStatus.Text = 'Git을 사용할 수 없습니다. 설치 상태를 확인해 주세요.'
+    }
     $form.BeginInvoke([Action]{ Check-ForUpdate $false }) | Out-Null
 })
 [void]$form.ShowDialog()

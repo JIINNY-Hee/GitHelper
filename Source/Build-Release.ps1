@@ -20,7 +20,11 @@ if (-not (Get-Command Invoke-ps2exe -ErrorAction SilentlyContinue)) {
 }
 
 Invoke-ps2exe -inputFile $source -outputFile $output -noConsole -DPIAware -supportOS `
-    -iconFile $icon -title "GitHelper v$Version" -product 'GitHelper' -version "$Version.0"
+    -iconFile $icon -title "GitHelper v$Version" -product 'GitHelper' -version "$Version.0" -ErrorAction Stop
+
+if (-not (Test-Path -LiteralPath $output)) {
+    throw "EXE build failed: $output"
+}
 
 Compress-Archive -LiteralPath $output -DestinationPath $zip -Force
 Write-Host "Built: $output"
