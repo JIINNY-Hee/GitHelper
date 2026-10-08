@@ -17,8 +17,8 @@ $env:LANG = 'ko_KR.UTF-8'
 $env:LC_ALL = 'ko_KR.UTF-8'
 
 
-$AppName = 'GitHelper v1.0.4'
-$AppVersion = [version]'1.0.4'
+$AppName = 'GitHelper v1.0.5'
+$AppVersion = [version]'1.0.5'
 $GitHubRepo = 'JIINNY-Hee/GitHelper'
 $ConfigDir = Join-Path $env:APPDATA 'GitHelper'
 $ConfigPath = Join-Path $ConfigDir 'config.json'
@@ -36,7 +36,9 @@ function Invoke-ProcessText {
     param(
         [Parameter(Mandatory=$true)][string]$FilePath,
         [Parameter(Mandatory=$true)][string[]]$Arguments,
-        [string]$WorkingDirectory
+        [string]$WorkingDirectory,
+        [switch]$RawOutput,
+        [string]$StandardInput
     )
 
     # PS2EXE's no-console host has no reliable console code page. Capture the
@@ -78,25 +80,41 @@ function Invoke-ProcessText {
         $startInfo.CreateNoWindow = $true
         $startInfo.RedirectStandardOutput = $true
         $startInfo.RedirectStandardError = $true
+        $startInfo.RedirectStandardInput = $PSBoundParameters.ContainsKey('StandardInput')
         $startInfo.StandardOutputEncoding = $script:Utf8NoBom
         $startInfo.StandardErrorEncoding = $script:Utf8NoBom
 
         $process = New-Object System.Diagnostics.Process
         $process.StartInfo = $startInfo
         [void]$process.Start()
-        $stdout = $process.StandardOutput.ReadToEnd()
-        $stderr = $process.StandardError.ReadToEnd()
-        $process.WaitForExit()
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        if ($startInfo.RedirectStandardInput) {
+            $process.StandardInput.Write($StandardInput)
+            $process.StandardInput.Close()
+        }
+        while (-not $process.WaitForExit(50)) {
+            if ($script:PrefabDependencyDiscoveryState -and $script:PrefabDependencyDiscoveryState.CancelRequested) {
+                $process.Kill()
+                throw (New-Object OperationCanceledException('Prefab 참조 조회를 취소했습니다.'))
+            }
+        }
+        $stdout = $stdoutTask.GetAwaiter().GetResult()
+        $stderr = $stderrTask.GetAwaiter().GetResult()
         $exitCode = $process.ExitCode
         $process.Dispose()
 
         [pscustomobject]@{
             ExitCode = $exitCode
-            StdOut = $stdout.TrimEnd()
+            StdOut = $(if ($RawOutput) { $stdout } else { $stdout.TrimEnd() })
             StdErr = $stderr.TrimEnd()
         }
     }
     finally {
+        if ($process) {
+            try { if (-not $process.HasExited) { $process.Kill() } } catch {}
+            $process.Dispose()
+        }
         Set-Location $oldLocation
     }
 }
@@ -113,7 +131,7 @@ $script:LoadingBaseBranch = $false
 $script:GitExePath = 'git.exe'
 
 function Invoke-Git {
-    param([Parameter(Mandatory=$true)][string[]]$GitArgs)
+    param([Parameter(Mandatory=$true)][string[]]$GitArgs, [switch]$RawOutput, [string]$StandardInput)
     if (-not $script:CurrentRepo -or -not (Test-Path -LiteralPath $script:CurrentRepo)) {
         throw 'Git 저장소 경로가 설정되지 않았습니다.'
     }
@@ -125,7 +143,9 @@ function Invoke-Git {
         '-c', 'core.quotepath=false'
     ) + $GitArgs
 
-    return Invoke-ProcessText -FilePath $script:GitExePath -Arguments $effectiveArgs -WorkingDirectory $script:CurrentRepo
+    $processArgs = @{ FilePath=$script:GitExePath; Arguments=$effectiveArgs; WorkingDirectory=$script:CurrentRepo; RawOutput=$RawOutput }
+    if ($PSBoundParameters.ContainsKey('StandardInput')) { $processArgs.StandardInput = $StandardInput }
+    return Invoke-ProcessText @processArgs
 }
 
 function Invoke-Gh {
@@ -134,6 +154,629 @@ function Invoke-Gh {
         throw 'Git 저장소 경로가 설정되지 않았습니다.'
     }
     return Invoke-ProcessText -FilePath 'gh.exe' -Arguments $GhArgs -WorkingDirectory $script:CurrentRepo
+}
+
+function Get-StageGitOutput([string[]]$GitArgs) {
+    $result = Invoke-Git -GitArgs $GitArgs -RawOutput
+    if ($result.ExitCode -ne 0) { throw "Git 조회 실패: $($result.StdErr.Trim())" }
+    return $result.StdOut
+}
+
+function Get-UnitySourceAssetDbPaths([string]$DatabasePath, [string[]]$Guids) {
+    # Unity already indexes GUID -> path in SourceAssetDB. Seek only requested
+    # keys; do not enumerate the database or open unrelated .meta files.
+    if (-not ('GitHelperStage.SourceAssetDbReader' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Text;
+
+namespace GitHelperStage {
+    public static class SourceAssetDbReader {
+        private const uint Magic = 0xBEEFC0DE;
+        private static readonly UTF8Encoding Utf8 = new UTF8Encoding(false, true);
+
+        private sealed class Snapshot {
+            public int Word, Header, PageSize;
+            public ulong Transaction, MainRoot, LastPage;
+        }
+
+        private sealed class Reader : IDisposable {
+            private readonly FileStream stream;
+            private readonly Dictionary<ulong, byte[]> pages = new Dictionary<ulong, byte[]>();
+            private Snapshot snapshot;
+
+            public Reader(string path) {
+                stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            }
+            public void Dispose() { stream.Dispose(); }
+
+            private byte[] Read(long offset, int size) {
+                if (offset < 0 || size < 0 || offset > stream.Length - size)
+                    throw new InvalidDataException("SourceAssetDB page is outside the file.");
+                byte[] bytes = new byte[size];
+                stream.Position = offset;
+                int done = 0;
+                while (done < size) {
+                    int count = stream.Read(bytes, done, size - done);
+                    if (count == 0) throw new EndOfStreamException("SourceAssetDB changed while reading.");
+                    done += count;
+                }
+                return bytes;
+            }
+
+            private static ulong Word(byte[] bytes, int offset, int width) {
+                return width == 8 ? BitConverter.ToUInt64(bytes, offset) : BitConverter.ToUInt32(bytes, offset);
+            }
+
+            private static Snapshot Metadata(byte[] bytes, int word, int pageSize) {
+                int header = word + 8;
+                if (BitConverter.ToUInt16(bytes, word + 2) != 8 ||
+                    BitConverter.ToUInt32(bytes, header) != Magic ||
+                    BitConverter.ToUInt32(bytes, header + 4) != 1)
+                    throw new InvalidDataException("Unsupported SourceAssetDB metadata.");
+                int firstDb = header + 8 + word * 2;
+                int dbSize = 8 + word * 5;
+                if (BitConverter.ToUInt32(bytes, firstDb) != pageSize)
+                    throw new InvalidDataException("Unsupported SourceAssetDB page size.");
+                return new Snapshot {
+                    Word = word, Header = header, PageSize = pageSize,
+                    MainRoot = Word(bytes, firstDb + dbSize + 8 + word * 4, word),
+                    LastPage = Word(bytes, firstDb + dbSize * 2, word),
+                    Transaction = Word(bytes, firstDb + dbSize * 2 + word, word)
+                };
+            }
+
+            private Snapshot CurrentSnapshot() {
+                byte[] probe = Read(0, 256);
+                int word = BitConverter.ToUInt32(probe, 16) == Magic ? 8 :
+                    (BitConverter.ToUInt32(probe, 12) == Magic ? 4 : 0);
+                if (word == 0 || !BitConverter.IsLittleEndian)
+                    throw new InvalidDataException("Unsupported SourceAssetDB format.");
+                int firstDb = word + 8 + 8 + word * 2;
+                int pageSize = (int)BitConverter.ToUInt32(probe, firstDb);
+                if (pageSize < 512 || pageSize > 65536 || (pageSize & (pageSize - 1)) != 0)
+                    throw new InvalidDataException("Unsupported SourceAssetDB page size.");
+                Snapshot first = Metadata(Read(0, pageSize), word, pageSize);
+                Snapshot second = Metadata(Read(pageSize, pageSize), word, pageSize);
+                Snapshot chosen = first.Transaction >= second.Transaction ? first : second;
+                if (chosen.LastPage < 1 || chosen.LastPage >= (ulong)(stream.Length / pageSize) ||
+                    chosen.MainRoot < 2 || chosen.MainRoot > chosen.LastPage)
+                    throw new InvalidDataException("Invalid SourceAssetDB root page.");
+                return chosen;
+            }
+
+            private byte[] Page(ulong number) {
+                if (number < 2 || number > snapshot.LastPage)
+                    throw new InvalidDataException("Invalid SourceAssetDB tree page.");
+                byte[] page;
+                if (!pages.TryGetValue(number, out page)) {
+                    page = Read(checked((long)number * snapshot.PageSize), snapshot.PageSize);
+                    if (Word(page, 0, snapshot.Word) != number)
+                        throw new InvalidDataException("SourceAssetDB page number mismatch.");
+                    pages.Add(number, page);
+                }
+                return page;
+            }
+
+            private int Node(byte[] page, int index) {
+                int offset = BitConverter.ToUInt16(page, snapshot.Header + index * 2);
+                int upper = BitConverter.ToUInt16(page, snapshot.Word + 6);
+                if (offset < upper || offset > page.Length - 8)
+                    throw new InvalidDataException("Invalid SourceAssetDB node offset.");
+                int length = BitConverter.ToUInt16(page, offset + 6);
+                if (length > page.Length - offset - 8)
+                    throw new InvalidDataException("Invalid SourceAssetDB key length.");
+                return offset;
+            }
+
+            private static int Compare(byte[] page, int offset, int length, byte[] key) {
+                for (int i = 0; i < Math.Min(length, key.Length); i++) {
+                    int result = page[offset + i] - key[i];
+                    if (result != 0) return result;
+                }
+                return length - key.Length;
+            }
+
+            private byte[] Find(ulong root, byte[] key, bool descriptor) {
+                for (int depth = 0; depth < 32; depth++) {
+                    byte[] page = Page(root);
+                    int flags = BitConverter.ToUInt16(page, snapshot.Word + 2);
+                    int lower = BitConverter.ToUInt16(page, snapshot.Word + 4);
+                    int upper = BitConverter.ToUInt16(page, snapshot.Word + 6);
+                    if ((flags != 1 && flags != 2) || lower < snapshot.Header ||
+                        lower > upper || upper > page.Length || (lower - snapshot.Header) % 2 != 0)
+                        throw new InvalidDataException("Unsupported SourceAssetDB tree page.");
+                    int count = (lower - snapshot.Header) / 2;
+                    int low = 0, high = count - 1, found = -1;
+                    while (low <= high) {
+                        int middle = (low + high) / 2;
+                        int offset = Node(page, middle);
+                        int length = BitConverter.ToUInt16(page, offset + 6);
+                        if (Compare(page, offset + 8, length, key) <= 0) { found = middle; low = middle + 1; }
+                        else high = middle - 1;
+                    }
+                    if (found < 0) return null;
+                    int node = Node(page, found);
+                    int keyLength = BitConverter.ToUInt16(page, node + 6);
+                    int nodeFlags = BitConverter.ToUInt16(page, node + 4);
+                    if (flags == 1) {
+                        root = BitConverter.ToUInt32(page, node);
+                        if (snapshot.Word == 8) root |= (ulong)nodeFlags << 32;
+                        continue;
+                    }
+                    if (Compare(page, node + 8, keyLength, key) != 0) return null;
+                    if (nodeFlags != (descriptor ? 2 : 0))
+                        throw new InvalidDataException("Unsupported SourceAssetDB value encoding.");
+                    uint size = BitConverter.ToUInt32(page, node);
+                    if (size > 65536 || size > page.Length - node - 8 - keyLength)
+                        throw new InvalidDataException("Unsupported SourceAssetDB value length.");
+                    byte[] value = new byte[(int)size];
+                    Buffer.BlockCopy(page, node + 8 + keyLength, value, 0, value.Length);
+                    return value;
+                }
+                throw new InvalidDataException("SourceAssetDB tree depth exceeded.");
+            }
+
+            private static byte[] GuidKey(string guid) {
+                if (guid == null || guid.Length != 32) throw new ArgumentException("Invalid Unity GUID.");
+                byte[] result = new byte[16];
+                for (int i = 0; i < 16; i++) {
+                    int low = Hex(guid[i * 2]), high = Hex(guid[i * 2 + 1]);
+                    if (low < 0 || high < 0) throw new ArgumentException("Invalid Unity GUID.");
+                    // Unity's GUID string writes the low nibble first.
+                    result[i] = (byte)(low | (high << 4));
+                }
+                return result;
+            }
+
+            private static int Hex(char value) {
+                if (value >= '0' && value <= '9') return value - '0';
+                if (value >= 'a' && value <= 'f') return value - 'a' + 10;
+                if (value >= 'A' && value <= 'F') return value - 'A' + 10;
+                return -1;
+            }
+
+            public Dictionary<string, string> Lookup(string[] guids) {
+                for (int attempt = 0; attempt < 3; attempt++) {
+                    snapshot = CurrentSnapshot();
+                    pages.Clear();
+                    try {
+                        byte[] database = Find(snapshot.MainRoot, Encoding.ASCII.GetBytes("GuidToPath"), true);
+                        int dbSize = 8 + snapshot.Word * 5;
+                        if (database == null || database.Length != dbSize || BitConverter.ToUInt16(database, 4) != 0)
+                            throw new InvalidDataException("SourceAssetDB GuidToPath index is unavailable.");
+                        ulong root = Word(database, 8 + snapshot.Word * 4, snapshot.Word);
+                        var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                        foreach (string guid in guids) {
+                            if (result.ContainsKey(guid)) continue;
+                            byte[] value = Find(root, GuidKey(guid), false);
+                            if (value == null) continue;
+                            int length = value.Length;
+                            if (length > 0 && value[length - 1] == 0) length--;
+                            string path = Utf8.GetString(value, 0, length);
+                            if (path.IndexOf('\0') >= 0 || path.IndexOf('\\') >= 0 ||
+                                !(path.StartsWith("Assets/", StringComparison.Ordinal) ||
+                                  path.StartsWith("Packages/", StringComparison.Ordinal)))
+                                throw new InvalidDataException("Unsupported SourceAssetDB asset path.");
+                            result[guid.ToLowerInvariant()] = path;
+                        }
+                        Snapshot after = CurrentSnapshot();
+                        if (after.Transaction == snapshot.Transaction && after.MainRoot == snapshot.MainRoot &&
+                            after.Word == snapshot.Word && after.PageSize == snapshot.PageSize) return result;
+                    }
+                    catch (InvalidDataException) {
+                        Snapshot after = CurrentSnapshot();
+                        if (after.Transaction == snapshot.Transaction) throw;
+                    }
+                }
+                throw new IOException("Unity is updating SourceAssetDB; retry when asset import completes.");
+            }
+        }
+
+        public static Dictionary<string, string> Lookup(string path, string[] guids) {
+            using (var reader = new Reader(path)) return reader.Lookup(guids);
+        }
+    }
+}
+'@
+    }
+    $result = @{}
+    if (-not $Guids -or $Guids.Count -eq 0) { return $result }
+    try {
+        $paths = [GitHelperStage.SourceAssetDbReader]::Lookup($DatabasePath, $Guids)
+        foreach ($pair in $paths.GetEnumerator()) { $result[$pair.Key] = @($pair.Value) }
+    } catch {
+        throw "Unity GUID 색인을 바로 조회하지 못했습니다: $($_.Exception.GetBaseException().Message)"
+    }
+    return $result
+}
+
+function Get-StageParseIndex([string]$IndexText) {
+    if (-not ('GitHelperStageIndexV106' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.IO;
+public sealed class GitHelperStageIndexEntryV106 {
+    public string Mode;
+    public string Oid;
+    public GitHelperStageIndexEntryV106(string mode, string oid) { Mode=mode; Oid=oid; }
+}
+public static class GitHelperStageIndexV106 {
+    public static string SafePath(string root, string path, Dictionary<string,GitHelperStageIndexEntryV106> index) {
+        if(String.IsNullOrEmpty(path)||Path.IsPathRooted(path)||path.IndexOf('\\')>=0) return null;
+        root=Path.GetFullPath(root).TrimEnd('\\','/');
+        string absolute=Path.GetFullPath(Path.Combine(root,path));
+        if(!absolute.StartsWith(root+Path.DirectorySeparatorChar,StringComparison.OrdinalIgnoreCase)) return null;
+        string current=root, relative="";
+        foreach(string part in path.Split('/')) {
+            if(part==".."||part=="."||part.Length==0) return null;
+            relative=relative.Length==0?part:relative+"/"+part;
+            GitHelperStageIndexEntryV106 entry;
+            if(index.TryGetValue(relative,out entry)&&(entry.Mode=="120000"||entry.Mode=="160000")) return null;
+            current=Path.Combine(current,part);
+            if((File.Exists(current)||Directory.Exists(current))&&(File.GetAttributes(current)&FileAttributes.ReparsePoint)!=0) return null;
+        }
+        return absolute;
+    }
+    public static Dictionary<string,GitHelperStageIndexEntryV106> Parse(string text) {
+        var result = new Dictionary<string,GitHelperStageIndexEntryV106>(StringComparer.OrdinalIgnoreCase);
+        foreach (var record in text.Split('\0')) {
+            if (record.Length==0) continue;
+            int first=record.IndexOf(' '), second=record.IndexOf(' ',first+1), tab=record.IndexOf('\t',second+1);
+            if(first<0||second<0||tab<0) throw new InvalidOperationException("Git index 목록을 해석하지 못했습니다.");
+            if(record.Substring(second+1,tab-second-1)!="0") throw new InvalidOperationException("충돌을 먼저 해결해 주세요: "+record.Substring(tab+1));
+            result[record.Substring(tab+1)] = new GitHelperStageIndexEntryV106(record.Substring(0,first),record.Substring(first+1,second-first-1));
+        }
+        return result;
+    }
+}
+'@
+    }
+    return ,([GitHelperStageIndexV106]::Parse($IndexText))
+}
+
+function Get-StageSnapshot {
+    # Disable rename inference: every index path is independently protected,
+    # and new paths are still discovered without accidentally staging removals.
+    $statusText = Get-StageGitOutput @('-c','status.renames=false','status','--porcelain=v1','-z','--untracked-files=all')
+    $indexText = Get-StageGitOutput @('ls-files','--stage','-z')
+    $status = @{}
+    $records = $statusText.Split([char]0)
+    for ($i = 0; $i -lt $records.Length; $i++) {
+        $record = $records[$i]
+        if (-not $record) { continue }
+        if ($record.Length -lt 4) { throw 'Git 변경 파일 목록을 해석하지 못했습니다.' }
+        $code = $record.Substring(0,2)
+        $path = $record.Substring(3)
+        if ($code -match 'U|AA|DD') { throw "충돌을 먼저 해결해 주세요: $path" }
+        # A staged deletion recreated in the worktree can also have a ??
+        # record. Keep the user's staged deletion instead of re-adding it.
+        if (-not ($code -eq '??' -and $status.ContainsKey($path) -and $status[$path][0] -ne ' ')) {
+            $status[$path] = $code
+        }
+        if ($code -match 'R|C') { $i++ }
+    }
+    $index = Get-StageParseIndex $indexText
+    return [pscustomobject]@{ StatusText=$statusText; IndexText=$indexText; Status=$status; Index=$index }
+}
+
+function Get-UnityProjectPrefix([string]$Path) {
+    if ($Path -match '^(?<Prefix>(?:[^/]+/)*?)(?:Assets|Packages)/') { return $Matches.Prefix }
+    return $null
+}
+
+function Get-UnityStageSafePath([string]$Path, $Snapshot) {
+    return [GitHelperStageIndexV106]::SafePath($script:CurrentRepo,$Path,$Snapshot.Index)
+}
+
+function Get-StageFileStamp([string]$AbsolutePath) {
+    if (-not [IO.File]::Exists($AbsolutePath)) { return 'missing' }
+    $info = New-Object IO.FileInfo($AbsolutePath)
+    return "$($info.Length):$($info.LastWriteTimeUtc.Ticks)"
+}
+
+function Get-StageFileHash([string]$AbsolutePath) {
+    if (-not [IO.File]::Exists($AbsolutePath)) { return 'missing' }
+    $stream = [IO.File]::OpenRead($AbsolutePath)
+    $hasher = [Security.Cryptography.SHA256]::Create()
+    try { return [BitConverter]::ToString($hasher.ComputeHash($stream)) }
+    finally { $stream.Dispose(); $hasher.Dispose() }
+}
+
+function Get-UnityStageText([string]$Path, $Context, [switch]$Meta) {
+    Get-StageCheckCancelled $Context.ShouldCancel
+    if ($Context.TextCache.ContainsKey($Path)) {
+        if ($Context.ReadPaths.Add($Path) -and $Meta) { $Context.MetaFilesRead++ }
+        return $Context.TextCache[$Path]
+    }
+    $absolute = Get-UnityStageSafePath $Path $Context.Snapshot
+    if (-not $absolute) {
+        [void]$Context.Warnings.Add("링크 또는 저장소 밖의 경로는 제외했습니다: $Path")
+        return $null
+    }
+    $code = $Context.Snapshot.Status[$Path]
+    $useIndex = $Context.Roots.Contains($Path) -or ($code -and $code[0] -ne ' ' -and $code -ne '??')
+    $extension = [IO.Path]::GetExtension($Path).ToLowerInvariant()
+    # Source image/model/audio data does not contain serialized GUID links.
+    # Its importer metadata is still visited by the caller.
+    if (-not $Meta -and $extension -in @('.png','.jpg','.jpeg','.tga','.psd','.exr','.hdr','.gif','.bmp','.tif','.tiff','.webp','.dds','.fbx','.blend','.max','.ma','.mb','.wav','.mp3','.ogg','.aif','.aiff','.mp4','.mov','.avi','.dll','.pdb','.ttf','.otf','.unitypackage','.zip')) { return $null }
+    if ($useIndex) {
+        if (-not $Context.Snapshot.Index.ContainsKey($Path)) { return $null }
+        if ($Context.ReadPaths.Add($Path) -and $Meta) { $Context.MetaFilesRead++ }
+        $content = Get-StageGitOutput @('cat-file','blob',$Context.Snapshot.Index[$Path].Oid)
+    } else {
+        if (-not [IO.File]::Exists($absolute)) { return $null }
+        if ($Context.ReadPaths.Add($Path) -and $Meta) { $Context.MetaFilesRead++ }
+        $Context.Stamps[$Path] = Get-StageFileStamp $absolute
+        $bytes = [IO.File]::ReadAllBytes($absolute)
+        if ([Array]::IndexOf($bytes,[byte]0) -ge 0) {
+            [void]$Context.Warnings.Add("바이너리 형식의 참조는 읽을 수 없습니다. Unity의 Asset Serialization을 Force Text로 저장해 주세요: $Path")
+            return $null
+        }
+        $content = $script:Utf8NoBom.GetString($bytes).TrimStart([char]0xfeff)
+        $hasher = [Security.Cryptography.SHA256]::Create()
+        try { $Context.Hashes[$Path] = [BitConverter]::ToString($hasher.ComputeHash($bytes)) }
+        finally { $hasher.Dispose() }
+        if ((Get-StageFileStamp $absolute) -ne $Context.Stamps[$Path]) {
+            throw "참조를 읽는 중 파일이 바뀌었습니다. 다시 조회해 주세요: $Path"
+        }
+    }
+    if ($content.IndexOf([char]0) -ge 0) {
+        [void]$Context.Warnings.Add("바이너리 형식의 참조는 읽을 수 없습니다. Unity의 Asset Serialization을 Force Text로 저장해 주세요: $Path")
+        return $null
+    }
+    $Context.TextCache[$Path] = $content
+    return $content
+}
+
+function Get-StageCheckCancelled([scriptblock]$ShouldCancel) {
+    if (($ShouldCancel -and (& $ShouldCancel)) -or ($script:PrefabDependencyDiscoveryState -and $script:PrefabDependencyDiscoveryState.CancelRequested)) {
+        throw (New-Object OperationCanceledException('Prefab 참조 조회를 취소했습니다.'))
+    }
+}
+
+function Get-UnityGuidLookup {
+    param([string]$Prefix,[string[]]$Guids,$Context)
+    Get-StageCheckCancelled $Context.ShouldCancel
+    if (-not $Context.GuidCache.ContainsKey($Prefix)) { $Context.GuidCache[$Prefix] = @{} }
+    $cache = $Context.GuidCache[$Prefix]
+    $missing = @($Guids | Sort-Object -Unique | Where-Object { $_ -notmatch '^0{16}' -and -not $cache.ContainsKey($_) })
+    if ($missing.Count -eq 0) { return $cache }
+    $Context.GuidLookupRequests++
+    if ($Context.ResolveGuids) {
+        $resolved = & $Context.ResolveGuids $Prefix $missing
+    } else {
+        $project = Join-Path $script:CurrentRepo $Prefix
+        $database = Join-Path $project 'Library\SourceAssetDB'
+        if (-not [IO.File]::Exists($database)) {
+            throw "Unity의 파일 경로 정보가 없습니다. 해당 프로젝트를 Unity에서 한 번 열어 Import를 완료한 뒤 다시 실행해 주세요: $project"
+        }
+        try { $projectPaths = Get-UnitySourceAssetDbPaths -DatabasePath $database -Guids $missing }
+        catch { throw "Unity 파일 경로 정보를 읽지 못했습니다. 프로젝트의 Import 상태를 확인해 주세요. 전체 메타 검색은 실행하지 않습니다.`r`n$($_.Exception.Message)" }
+        $resolved = @{}
+        foreach ($guid in $missing) {
+            $resolved[$guid] = @($projectPaths[$guid] | Where-Object { $_ } | ForEach-Object { "$Prefix$_" })
+        }
+    }
+    foreach ($guid in $missing) {
+        $paths = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        if ($resolved) {
+            foreach ($path in @($resolved[$guid])) {
+                if ($path -and (Get-UnityProjectPrefix $path) -eq $Prefix -and (Get-UnityStageSafePath $path $Context.Snapshot)) { [void]$paths.Add($path) }
+            }
+        }
+        # Only dirty metadata in the Git index needs an overlay: staged GUIDs
+        # can differ from Unity's current imported worktree. No disk meta sweep.
+        if ($Context.IndexGuidOverrides.ContainsKey($Prefix) -and $Context.IndexGuidOverrides[$Prefix].ContainsKey($guid)) {
+            foreach ($path in $Context.IndexGuidOverrides[$Prefix][$guid]) { [void]$paths.Add($path) }
+        }
+        $cache[$guid] = @($paths)
+    }
+    return $cache
+}
+
+function Get-StageMetadataOverrides($Context) {
+    $oids = New-Object 'System.Collections.Generic.HashSet[string]'
+    $metaPaths = @($Context.Snapshot.Status.Keys | Where-Object {
+        $_.EndsWith('.meta',[StringComparison]::OrdinalIgnoreCase) -and $Context.ProjectPrefixes.Contains((Get-UnityProjectPrefix $_)) -and
+        $Context.Snapshot.Index.ContainsKey($_) -and $Context.Snapshot.Status[$_][0] -ne 'D'
+    })
+    foreach ($path in $metaPaths) { [void]$oids.Add($Context.Snapshot.Index[$path].Oid) }
+    if ($oids.Count -eq 0) { return }
+    $Context.IndexMetadataRead = $metaPaths.Count
+    Get-StageCheckCancelled $Context.ShouldCancel
+    $result = Invoke-Git -GitArgs @('cat-file','--batch') -RawOutput -StandardInput (($oids -join "`n") + "`n")
+    if ($result.ExitCode -ne 0) { throw "Git Stage 메타 조회 실패: $($result.StdErr)" }
+    $data = $script:Utf8NoBom.GetBytes($result.StdOut)
+    $blobs = @{}
+    $offset = 0
+    while ($offset -lt $data.Length) {
+        $end = [Array]::IndexOf($data,[byte]10,$offset)
+        if ($end -lt 0) { throw 'Git 메타 응답을 해석하지 못했습니다.' }
+        $header = $script:Utf8NoBom.GetString($data,$offset,$end-$offset)
+        if ($header -notmatch '^(?<Oid>[0-9a-f]+) blob (?<Size>\d+)$') { throw 'Git 메타 blob을 확인하지 못했습니다.' }
+        $oid = $Matches.Oid; $size = [int]$Matches.Size
+        $offset = $end + 1
+        if ($offset + $size -gt $data.Length) { throw 'Git 메타 응답이 잘렸습니다.' }
+        $blobs[$oid] = $script:Utf8NoBom.GetString($data,$offset,$size)
+        $offset += $size + 1
+    }
+    foreach ($path in $metaPaths) {
+        $prefix = Get-UnityProjectPrefix $path
+        if ($null -eq $prefix -or -not $Context.ProjectPrefixes.Contains($prefix)) { continue }
+        $text = $blobs[$Context.Snapshot.Index[$path].Oid]
+        if ($text -match '(?m)^guid:\s*([0-9a-fA-F]{32})\s*$') {
+            $guid = $Matches[1].ToLowerInvariant()
+            if (-not $Context.IndexGuidOverrides.ContainsKey($prefix)) { $Context.IndexGuidOverrides[$prefix] = @{} }
+            $map = $Context.IndexGuidOverrides[$prefix]
+            if (-not $map.ContainsKey($guid)) { $map[$guid] = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase) }
+            [void]$map[$guid].Add($path.Substring(0,$path.Length-5))
+        }
+        $code = $Context.Snapshot.Status[$path]
+        if ($code[0] -ne ' ') { $Context.TextCache[$path] = $text }
+    }
+}
+
+function Get-PrefabDependencyStagePlan {
+    param([scriptblock]$OnProgress,[scriptblock]$ResolveGuids,[scriptblock]$ShouldCancel)
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    Get-StageCheckCancelled $ShouldCancel
+    $snapshot = Get-StageSnapshot
+    $roots = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($path in $snapshot.Status.Keys) {
+        $code = $snapshot.Status[$path]
+        if ($code -eq '??' -or $code[0] -notin @('A','M','R','C','T')) { continue }
+        $prefab = if ($path.EndsWith('.prefab.meta',[StringComparison]::OrdinalIgnoreCase)) { $path.Substring(0,$path.Length-5) } elseif ($path.EndsWith('.prefab',[StringComparison]::OrdinalIgnoreCase)) { $path } else { $null }
+        if ($prefab -and $snapshot.Index.ContainsKey($prefab)) { [void]$roots.Add($prefab) }
+    }
+    $context = [pscustomobject]@{
+        Snapshot=$snapshot; Roots=$roots; TextCache=@{}; Stamps=@{}; Hashes=@{};
+        Warnings=(New-Object 'System.Collections.Generic.HashSet[string]');
+        Protected=(New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase));
+        Candidates=@{}; Reasons=@{}; Visited=(New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase));
+        BlockedAssets=(New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase));
+        ProjectPrefixes=(New-Object 'System.Collections.Generic.HashSet[string]');
+        GuidCache=@{}; IndexGuidOverrides=@{}; ResolveGuids=$ResolveGuids; ShouldCancel=$ShouldCancel;
+        MetaFilesRead=0; IndexMetadataRead=0; GuidLookupRequests=0; ReadPaths=(New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase))
+    }
+    $plan = [pscustomobject]@{
+        Repo=$script:CurrentRepo; Roots=@($roots | Sort-Object); Candidates=@(); ProtectedPaths=@(); Warnings=@();
+        StatusText=$snapshot.StatusText; IndexText=$snapshot.IndexText; Stamps=$context.Stamps; Hashes=$context.Hashes;
+        MetaFilesRead=0; IndexMetadataRead=0; GuidLookupRequests=0; ReadPaths=@(); ElapsedMilliseconds=0
+    }
+    if ($roots.Count -eq 0) { $plan.ElapsedMilliseconds=$timer.ElapsedMilliseconds; return $plan }
+    $allPaths = [System.Collections.Generic.HashSet[string]]::new($snapshot.Index.Keys,[StringComparer]::OrdinalIgnoreCase)
+    foreach ($path in $snapshot.Status.Keys) { if ($snapshot.Status[$path] -eq '??') { [void]$allPaths.Add($path) } }
+    foreach ($root in $roots) {
+        $prefix=Get-UnityProjectPrefix $root
+        if ($null -ne $prefix) { [void]$context.ProjectPrefixes.Add($prefix) }
+    }
+    Get-StageMetadataOverrides $context
+    $queue = New-Object 'System.Collections.Generic.Queue[string]'
+    foreach ($root in $roots) { $queue.Enqueue($root); $context.Reasons[$root]='Stage된 Prefab' }
+    while ($queue.Count -gt 0) {
+        Get-StageCheckCancelled $ShouldCancel
+        $references = New-Object 'System.Collections.Generic.List[object]'
+        $requests = @{}
+        $waveCount = $queue.Count
+        for ($n=0; $n -lt $waveCount; $n++) {
+            Get-StageCheckCancelled $ShouldCancel
+            $path = $queue.Dequeue()
+            if (-not $context.Visited.Add($path)) { continue }
+            $prefix = Get-UnityProjectPrefix $path
+            if ($null -eq $prefix -or -not $context.ProjectPrefixes.Contains($prefix)) { continue }
+            $absolute = Get-UnityStageSafePath $path $snapshot
+            if (-not $absolute) { [void]$context.Warnings.Add("링크 경로는 제외했습니다: $path"); continue }
+            $code = $snapshot.Status[$path]
+            $alreadyStaged = $roots.Contains($path) -or ($code -and $code -ne '??' -and $code[0] -ne ' ')
+            if ($alreadyStaged) {
+                if ($code -and $code[1] -ne ' ') { [void]$context.Protected.Add($path) }
+                if ($code -and $code[0] -eq 'D') { [void]$context.Warnings.Add("참조된 리소스가 Stage에서 삭제되어 있습니다: $path"); continue }
+            } elseif (($code -eq '??' -or ($code -and $code[1] -in @('M','T','A'))) -and [IO.File]::Exists($absolute)) {
+                $context.Candidates[$path] = [pscustomobject]@{ Path=$path; Status=$(if ($code -eq '??') {'추가'}else{'변경'}); Reason=$context.Reasons[$path] }
+                $context.Hashes[$path] = Get-StageFileHash $absolute
+            } elseif ($code -and $code[1] -eq 'D') {
+                [void]$context.Warnings.Add("참조된 리소스가 작업 폴더에서 삭제되어 있습니다. 삭제는 Stage하지 않았습니다: $path")
+            }
+            if (-not $path.EndsWith('.meta',[StringComparison]::OrdinalIgnoreCase)) {
+                $metaPath="$path.meta"
+                if ($allPaths.Contains($metaPath)) { $queue.Enqueue($metaPath); $context.Reasons[$metaPath]="$path 의 메타 파일" }
+                $parent=$path
+                while ($parent.Contains('/')) {
+                    $parent=$parent.Substring(0,$parent.LastIndexOf('/'))
+                    if ($parent -eq "$($prefix)Assets" -or $parent -eq "$($prefix)Packages") { break }
+                    if ($allPaths.Contains("$parent.meta") -and $snapshot.Status.ContainsKey("$parent.meta")) { $queue.Enqueue("$parent.meta"); $context.Reasons["$parent.meta"]="$path 의 상위 폴더 메타 파일" }
+                }
+            }
+            $content=Get-UnityStageText $path $context -Meta:($path.EndsWith('.meta',[StringComparison]::OrdinalIgnoreCase))
+            if ($null -eq $content) { continue }
+            if (-not $requests.ContainsKey($prefix)) { $requests[$prefix]=New-Object 'System.Collections.Generic.HashSet[string]' }
+            foreach ($match in [regex]::Matches($content,'(?i)(?<![0-9a-f])[0-9a-f]{32}(?![0-9a-f])')) {
+                $guid=$match.Value.ToLowerInvariant()
+                if ($guid -match '^0{16}') { continue }
+                [void]$requests[$prefix].Add($guid)
+                $references.Add([pscustomobject]@{Prefix=$prefix; Guid=$guid; Source=$path})
+            }
+            if ([IO.Path]::GetExtension($path) -in @('.shader','.hlsl','.cginc','.compute','.glsl')) {
+                foreach ($match in [regex]::Matches($content,'(?m)^\s*#\s*include(?:_with_pragmas)?\s*"(?<Path>[^"\r\n]+)"')) {
+                    $include=$match.Groups['Path'].Value.Replace('\','/')
+                    $possible=if($include -match '^(Assets|Packages)/'){@("$prefix$include")}else{@(($path.Substring(0,$path.LastIndexOf('/')+1)+$include),"$prefix$include")}
+                    foreach($includePath in $possible){
+                        $full=[IO.Path]::GetFullPath((Join-Path $script:CurrentRepo $includePath)); $repoPrefix=[IO.Path]::GetFullPath($script:CurrentRepo).TrimEnd('\','/')+[IO.Path]::DirectorySeparatorChar
+                        if(-not $full.StartsWith($repoPrefix,[StringComparison]::OrdinalIgnoreCase)){continue}
+                        $normalized=$full.Substring($repoPrefix.Length).Replace('\','/')
+                        if((Get-UnityProjectPrefix $normalized)-eq $prefix -and $allPaths.Contains($normalized)){$queue.Enqueue($normalized);$context.Reasons[$normalized]="$path 의 Shader include";break}
+                    }
+                }
+            }
+        }
+        foreach ($prefix in $requests.Keys) { [void](Get-UnityGuidLookup -Prefix $prefix -Guids @($requests[$prefix]) -Context $context) }
+        foreach ($reference in $references) {
+            $paths=@($context.GuidCache[$reference.Prefix][$reference.Guid])
+            if ($paths.Count -gt 1) {
+                [void]$context.Warnings.Add("중복 GUID의 리소스는 제외했습니다. 이동한 파일은 이전 경로의 삭제도 함께 Stage해 주세요: $($reference.Guid) ($($paths -join ', '))")
+                foreach ($assetPath in $paths) { [void]$context.BlockedAssets.Add($assetPath) }
+                if ($reference.Source.EndsWith('.meta',[StringComparison]::OrdinalIgnoreCase)) { [void]$context.BlockedAssets.Add($reference.Source.Substring(0,$reference.Source.Length-5)) }
+                continue
+            }
+            if ($paths.Count -eq 0) {
+                # ShaderGraph object IDs are not asset GUIDs. Warn only for
+                # unresolved serialized asset reference fields, not every ID.
+                $sourceText=$context.TextCache[$reference.Source]
+                if ($sourceText -match ('(?i)\bguid(?:\\?"|\x27)?\s*[:=]\s*(?:\\?"|\x27)?'+$reference.Guid+'\b')) {
+                    [void]$context.Warnings.Add("Unity에서 참조 GUID 경로를 찾지 못했습니다. Import 또는 외부 패키지를 확인해 주세요: $($reference.Guid) ← $($reference.Source)")
+                }
+                continue
+            }
+            $dependency=$paths[0]
+            $metaCode=$snapshot.Status["$dependency.meta"]
+            if ($metaCode -and $metaCode[0] -eq 'D') { continue }
+            if (-not $allPaths.Contains($dependency) -and -not $allPaths.Contains("$dependency.meta")) { continue }
+            if (-not $context.Reasons.ContainsKey($dependency)) { $context.Reasons[$dependency]="$($reference.Source) 에서 참조" }
+            $queue.Enqueue($dependency)
+        }
+        if ($OnProgress) { & $OnProgress "참조 파일 $($context.Visited.Count)개 확인 / 관련 메타 $($context.MetaFilesRead)개 / Stage 후보 $($context.Candidates.Count)개" | Out-Null }
+    }
+    foreach ($assetPath in $context.BlockedAssets) { $context.Candidates.Remove($assetPath); $context.Candidates.Remove("$assetPath.meta") }
+    $plan.Candidates=@($context.Candidates.Values | Sort-Object Path); $plan.ProtectedPaths=@($context.Protected | Sort-Object); $plan.Warnings=@($context.Warnings | Sort-Object)
+    $plan.MetaFilesRead=$context.MetaFilesRead; $plan.IndexMetadataRead=$context.IndexMetadataRead; $plan.GuidLookupRequests=$context.GuidLookupRequests; $plan.ReadPaths=@($context.ReadPaths | Sort-Object); $plan.ElapsedMilliseconds=$timer.ElapsedMilliseconds
+    return $plan
+}
+
+
+function Add-PrefabDependencyStagePlan {
+    param([Parameter(Mandatory=$true)]$Plan)
+    if ($script:CurrentRepo -ne $Plan.Repo) { throw '저장소가 바뀌었습니다. Prefab 리소스를 다시 조회해 주세요.' }
+    $snapshot = Get-StageSnapshot
+    if ($snapshot.StatusText -cne $Plan.StatusText -or $snapshot.IndexText -cne $Plan.IndexText) {
+        throw '조회 후 Git Stage 상태가 바뀌었습니다. Prefab 리소스를 다시 조회해 주세요.'
+    }
+    foreach ($path in $Plan.Stamps.Keys) {
+        $absolute = Get-UnityStageSafePath $path $snapshot
+        if (-not $absolute -or (Get-StageFileStamp $absolute) -ne $Plan.Stamps[$path]) {
+            throw "조회 후 파일이 바뀌었습니다. 다시 조회해 주세요: $path"
+        }
+    }
+    foreach ($path in $Plan.Hashes.Keys) {
+        $absolute = Get-UnityStageSafePath $path $snapshot
+        if (-not $absolute -or (Get-StageFileHash $absolute) -ne $Plan.Hashes[$path]) {
+            throw "조회 후 파일 내용이 바뀌었습니다. 다시 조회해 주세요: $path"
+        }
+    }
+    $paths = @($Plan.Candidates | ForEach-Object { $_.Path })
+    if ($paths.Count -eq 0) { return @() }
+    # One Git invocation is atomic for the index and bypasses Windows' command
+    # length limit. NUL and literal pathspecs preserve Korean, spaces and [].
+    $pathspecFile = [IO.Path]::GetTempFileName()
+    try {
+        [IO.File]::WriteAllText($pathspecFile, (($paths -join [string][char]0) + [char]0), $script:Utf8NoBom)
+        $result = Invoke-Git -GitArgs @('--literal-pathspecs','add',"--pathspec-from-file=$pathspecFile",'--pathspec-file-nul')
+        if ($result.ExitCode -ne 0) { throw "리소스 Stage 실패: $($result.StdErr)" }
+    } finally { [IO.File]::Delete($pathspecFile) }
+    return $paths
 }
 
 function Save-Config([string]$RepoPath) {
@@ -649,6 +1292,7 @@ function Set-Busy([bool]$Busy) {
     $btnRun.Enabled = -not $Busy
     $btnDeleteCommit.Enabled = (-not $Busy) -and ($script:VisibleCommits.Count -gt 0)
     $btnChangedFiles.Enabled = (-not $Busy) -and (($script:VisibleCommits.Count -gt 0) -or ($script:VisiblePushedCommits.Count -gt 0))
+    $btnPrefabDependencyStage.Enabled = (-not $Busy) -and ($txtRepo.Text.Trim()) -and (Test-Path -LiteralPath $txtRepo.Text.Trim() -PathType Container)
     $btnCreateBranch.Enabled = -not $Busy
     $btnMergeDevelop.Enabled = (-not $Busy) -and ($btnMergeDevelop.Tag -eq 'Allowed')
     $btnUpdate.Enabled = -not $Busy
@@ -929,6 +1573,316 @@ function Undo-LastCommit {
     finally {
         Set-Busy $false
         Refresh-View
+    }
+}
+
+function Invoke-PrefabDependencyStageDiscovery {
+    param([Parameter(Mandatory=$true)][string]$Repo, [System.Windows.Forms.IWin32Window]$Owner)
+
+    # Keep discovery away from the Forms thread. Copy the already loaded
+    # functions so this also works in the single-file PS2EXE application.
+    $workerState = [hashtable]::Synchronized(@{
+        Message='Git의 현재 Stage 상태를 확인합니다...'; Plan=$null; Error=$null;
+        CancelRequested=$false; Finished=$false
+    })
+    $definitions = New-Object System.Text.StringBuilder
+    foreach ($command in @(Get-Command -CommandType Function | Where-Object {
+        $_.Name -in @('Invoke-Git','Invoke-ProcessText') -or
+        $_.Name -match '^(Get-Stage|Get-Unity|Get-Prefab|Add-Prefab|Test-Unity|Read-Unity|New-Unity|Resolve-Unity)'
+    })) {
+        [void]$definitions.AppendLine("function $($command.Name) {")
+        [void]$definitions.AppendLine($command.Definition)
+        [void]$definitions.AppendLine('}')
+    }
+    $workerScript = @'
+param($Repo, $GitPath, $TextEncoding, $State)
+$ErrorActionPreference = 'Stop'
+$script:CurrentRepo = $Repo
+$script:GitExePath = $GitPath
+$script:Utf8NoBom = $TextEncoding
+$script:PrefabDependencyDiscoveryState = $State
+'@ + "`r`n" + $definitions.ToString() + @'
+
+try {
+    $root = Invoke-Git -GitArgs @('rev-parse','--show-toplevel')
+    if ($root.ExitCode -ne 0 -or -not $root.StdOut) { throw '선택한 폴더가 Git 저장소가 아닙니다.' }
+    $script:CurrentRepo = $root.StdOut
+    if ($State.CancelRequested) { return }
+    $arguments = @{ OnProgress = { param($message) $State.Message = [string]$message } }
+    if ((Get-Command Get-PrefabDependencyStagePlan).Parameters.ContainsKey('ShouldCancel')) {
+        $arguments.ShouldCancel = { [bool]$State.CancelRequested }
+    }
+    $plan = Get-PrefabDependencyStagePlan @arguments
+    if (-not $State.CancelRequested) { $State.Plan = $plan }
+} catch {
+    if (-not $State.CancelRequested) { $State.Error = $_.Exception.Message }
+} finally {
+    $State.Finished = $true
+}
+'@
+
+    $pipeline = $null
+    $runspace = $null
+    $progressForm = $null
+    $timer = $null
+    $async = $null
+    $uiState = @{ AllowClose=$false; LastMessage=$null; StopRequested=$false }
+    try {
+        $runspace = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
+        $runspace.Open()
+        $pipeline = [System.Management.Automation.PowerShell]::Create()
+        $pipeline.Runspace = $runspace
+        [void]$pipeline.AddScript($workerScript).AddArgument($Repo).AddArgument($script:GitExePath).AddArgument($script:Utf8NoBom).AddArgument($workerState)
+
+        $progressForm = New-Object System.Windows.Forms.Form
+        $progressForm.Text = 'GitHelper - Prefab 참조 확인'
+        $progressForm.ClientSize = New-Object System.Drawing.Size(520,160)
+        $progressForm.FormBorderStyle = 'FixedDialog'
+        $progressForm.StartPosition = 'CenterParent'
+        $progressForm.Font = New-Object System.Drawing.Font('Malgun Gothic',9)
+        $progressForm.MinimizeBox = $false
+        $progressForm.MaximizeBox = $false
+        try { $progressForm.Icon = $form.Icon } catch {}
+
+        $progressLabel = New-Object System.Windows.Forms.Label
+        $progressLabel.Text = "Prefab 참조 파일 확인 중`r`n$($workerState.Message)"
+        $progressLabel.Location = New-Object System.Drawing.Point(20,18)
+        $progressLabel.Size = New-Object System.Drawing.Size(480,58)
+        $progressForm.Controls.Add($progressLabel)
+
+        $progressBar = New-Object System.Windows.Forms.ProgressBar
+        $progressBar.Location = New-Object System.Drawing.Point(20,84)
+        $progressBar.Size = New-Object System.Drawing.Size(346,20)
+        $progressBar.Style = 'Marquee'
+        $progressBar.MarqueeAnimationSpeed = 35
+        $progressForm.Controls.Add($progressBar)
+
+        $cancelButton = New-Object System.Windows.Forms.Button
+        $cancelButton.Text = '취소'
+        $cancelButton.Location = New-Object System.Drawing.Point(390,80)
+        $cancelButton.Size = New-Object System.Drawing.Size(110,32)
+        Set-ModernButtonStyle $cancelButton $false
+        $progressForm.Controls.Add($cancelButton)
+        $progressForm.CancelButton = $cancelButton
+        $cancelButton.DialogResult = [System.Windows.Forms.DialogResult]::None
+
+        $requestCancel = {
+            if ($uiState.StopRequested) { return }
+            $uiState.StopRequested = $true
+            $workerState.CancelRequested = $true
+            $cancelButton.Enabled = $false
+            $progressLabel.Text = 'Prefab 참조 확인을 취소하는 중...'
+            # Stop asynchronously; cancellation must never wait for the worker
+            # on the Forms thread. Discovery cannot stage or modify any file.
+            try { [void]$pipeline.BeginStop($null,$null) } catch {}
+        }.GetNewClosure()
+        $cancelButton.Add_Click($requestCancel)
+        $progressForm.Add_FormClosing({
+            param($sender,$eventArgs)
+            if (-not $uiState.AllowClose) {
+                $eventArgs.Cancel = $true
+                & $requestCancel
+            }
+        }.GetNewClosure())
+
+        $timer = New-Object System.Windows.Forms.Timer
+        $timer.Interval = 75
+        $timer.Add_Tick({
+            if (-not $workerState.CancelRequested -and $uiState.LastMessage -ne $workerState.Message) {
+                $uiState.LastMessage = $workerState.Message
+                $progressLabel.Text = "Prefab 참조 파일 확인 중`r`n$($workerState.Message)"
+            }
+            $invocationState = $pipeline.InvocationStateInfo.State
+            if ($invocationState -in @(
+                [System.Management.Automation.PSInvocationState]::Completed,
+                [System.Management.Automation.PSInvocationState]::Failed,
+                [System.Management.Automation.PSInvocationState]::Stopped
+            )) {
+                $timer.Stop()
+                $uiState.AllowClose = $true
+                $progressForm.Close()
+            }
+        }.GetNewClosure())
+
+        if ($Owner -is [System.Windows.Forms.Control]) { $Owner.UseWaitCursor = $false }
+        $async = $pipeline.BeginInvoke()
+        $timer.Start()
+        if ($Owner) { [void]$progressForm.ShowDialog($Owner) }
+        else { [void]$progressForm.ShowDialog() }
+        try { [void]$pipeline.EndInvoke($async) }
+        catch { if (-not $workerState.CancelRequested) { throw } }
+        if ($workerState.CancelRequested) { return $null }
+        if ($workerState.Error) { throw $workerState.Error }
+        if (-not $workerState.Plan) {
+            if ($pipeline.Streams.Error.Count -gt 0) { throw $pipeline.Streams.Error[0].Exception }
+            throw 'Prefab 참조 조회 결과를 받지 못했습니다.'
+        }
+        return $workerState.Plan
+    }
+    finally {
+        if ($timer) { $timer.Stop(); $timer.Dispose() }
+        if ($progressForm) { $progressForm.Dispose() }
+        if ($pipeline) { $pipeline.Dispose() }
+        if ($runspace) { $runspace.Dispose() }
+    }
+}
+
+function Show-PrefabDependencyStageWindow {
+    $repo = $txtRepo.Text.Trim()
+    if (-not $repo -or -not (Test-Path -LiteralPath $repo -PathType Container)) {
+        Show-Error '올바른 저장소 폴더를 먼저 선택해 주세요.'
+        return
+    }
+
+    $stageForm = $null
+    $stageAttempted = $false
+    Set-Busy $true
+    try {
+        # Dependency staging only needs the local worktree and index. Do not
+        # require origin, a base branch, or a fetch to inspect the staged Prefabs.
+        Append-Log '현재 Stage된 Prefab의 참조 리소스를 확인합니다...'
+        $plan = Invoke-PrefabDependencyStageDiscovery -Repo $repo -Owner $form
+        if ($null -eq $plan) {
+            Append-Log 'Prefab 참조 확인을 취소했습니다. Stage는 변경하지 않았습니다.'
+            return
+        }
+        $script:CurrentRepo = $plan.Repo
+        $roots = @($plan.Roots)
+        $candidates = @($plan.Candidates)
+        $warnings = @($plan.Warnings)
+        $protectedPaths = @($plan.ProtectedPaths)
+        foreach ($warning in $warnings) { Append-Log "Prefab 리소스 확인: $warning" }
+        if ($roots.Count -eq 0) {
+            Append-Log '현재 Stage된 Prefab이 없습니다.'
+            Show-Info '현재 Stage된 Prefab이 없습니다. Prefab을 먼저 Stage한 뒤 다시 실행해 주세요.'
+            return
+        }
+        Append-Log "Stage된 Prefab $($roots.Count)개에서 추가/변경 리소스 $($candidates.Count)개를 찾았습니다."
+        if ($plan.PSObject.Properties.Name -contains 'MetaFilesRead') {
+            Append-Log "실제 참조의 meta $($plan.MetaFilesRead)개 확인 / $([Math]::Round($plan.ElapsedMilliseconds / 1000, 2))초"
+        }
+        if ($candidates.Count -eq 0) {
+            $notice = "Stage된 Prefab $($roots.Count)개를 확인했습니다.`r`n추가로 Stage할 참조 리소스가 없습니다."
+            if ($warnings.Count -gt 0) { $notice += "`r`n`r`n확인 사항:`r`n" + ($warnings -join "`r`n") }
+            if ($protectedPaths.Count -gt 0) { $notice += "`r`n`r`n기존 Stage 보호로 제외된 파일:`r`n" + ($protectedPaths -join "`r`n") }
+            Show-Info $notice
+            return
+        }
+
+        $stageForm = New-Object System.Windows.Forms.Form
+        $stageForm.Text = 'GitHelper - Prefab 리소스 Stage'
+        $stageForm.Size = New-Object System.Drawing.Size(1040,730)
+        $stageForm.MinimumSize = New-Object System.Drawing.Size(760,600)
+        $stageForm.StartPosition = 'CenterParent'
+        $stageForm.Font = New-Object System.Drawing.Font('Malgun Gothic',9)
+        $stageForm.BackColor = [System.Drawing.SystemColors]::Control
+        $stageForm.ForeColor = [System.Drawing.SystemColors]::ControlText
+        $stageForm.MinimizeBox = $false
+        try { $stageForm.Icon = $form.Icon } catch {}
+
+        $summary = New-Object System.Windows.Forms.Label
+        $summary.Text = "Stage된 Prefab $($roots.Count)개 → 추가/변경 리소스 $($candidates.Count)개. 아래 파일을 모두 Stage합니다."
+        $summary.Location = New-Object System.Drawing.Point(16,16)
+        $summary.Size = New-Object System.Drawing.Size(990,28)
+        $summary.Anchor = 'Top,Left,Right'
+        $stageForm.Controls.Add($summary)
+
+        $columns = New-Object System.Windows.Forms.Label
+        $columns.Text = '상태  |  파일 경로  |  참조 원인'
+        $columns.AutoSize = $true
+        $columns.Location = New-Object System.Drawing.Point(16,48)
+        $stageForm.Controls.Add($columns)
+
+        $candidateList = New-Object System.Windows.Forms.ListBox
+        $candidateList.Location = New-Object System.Drawing.Point(16,74)
+        $candidateList.Size = New-Object System.Drawing.Size(990,350)
+        $candidateList.Anchor = 'Top,Bottom,Left,Right'
+        $candidateList.SelectionMode = [System.Windows.Forms.SelectionMode]::None
+        $candidateList.HorizontalScrollbar = $true
+        $candidateList.IntegralHeight = $false
+        $candidateList.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+        $candidateList.BackColor = [System.Drawing.SystemColors]::Window
+        $candidateList.ForeColor = [System.Drawing.SystemColors]::WindowText
+        foreach ($candidate in $candidates) {
+            [void]$candidateList.Items.Add("$($candidate.Status)  |  $($candidate.Path)  |  $($candidate.Reason)")
+        }
+        $stageForm.Controls.Add($candidateList)
+
+        $details = New-Object System.Windows.Forms.TextBox
+        $details.Location = New-Object System.Drawing.Point(16,436)
+        $details.Size = New-Object System.Drawing.Size(990,176)
+        $details.Anchor = 'Bottom,Left,Right'
+        $details.Multiline = $true
+        $details.ReadOnly = $true
+        $details.ScrollBars = 'Both'
+        $details.WordWrap = $false
+        $details.BackColor = [System.Drawing.SystemColors]::Window
+        $details.ForeColor = [System.Drawing.SystemColors]::WindowText
+        $detailLines = New-Object System.Collections.Generic.List[string]
+        $detailLines.Add('Stage된 Prefab에 저장된 참조부터 실제 연결된 리소스만 확인합니다.')
+        if ($plan.PSObject.Properties.Name -contains 'MetaFilesRead') {
+            $detailLines.Add("실제 참조의 meta $($plan.MetaFilesRead)개 확인 / $([Math]::Round($plan.ElapsedMilliseconds / 1000, 2))초")
+        }
+        $detailLines.Add('바이너리 원본 모델 내부의 참조와 코드의 문자열 로드는 별도 확인이 필요합니다.')
+        $detailLines.Add('')
+        $detailLines.Add('기준 Prefab:')
+        foreach ($path in $roots) { $detailLines.Add("  $path") }
+        if ($warnings.Count -gt 0) {
+            $detailLines.Add(''); $detailLines.Add('확인 사항:')
+            foreach ($warning in $warnings) { $detailLines.Add("  $warning") }
+        }
+        if ($protectedPaths.Count -gt 0) {
+            $detailLines.Add(''); $detailLines.Add('기존 Stage 보호로 제외된 파일:')
+            foreach ($path in $protectedPaths) { $detailLines.Add("  $path") }
+        }
+        $details.Text = $detailLines -join "`r`n"
+        $stageForm.Controls.Add($details)
+
+        $btnStageAll = New-Object System.Windows.Forms.Button
+        $btnStageAll.Text = '모두 Stage'
+        $btnStageAll.Location = New-Object System.Drawing.Point(738,638)
+        $btnStageAll.Size = New-Object System.Drawing.Size(130,34)
+        $btnStageAll.Anchor = 'Bottom,Right'
+        $btnStageAll.DialogResult = [System.Windows.Forms.DialogResult]::OK
+        Set-ModernButtonStyle $btnStageAll $true
+        $stageForm.Controls.Add($btnStageAll)
+
+        $btnCancelStage = New-Object System.Windows.Forms.Button
+        $btnCancelStage.Text = '취소'
+        $btnCancelStage.Location = New-Object System.Drawing.Point(876,638)
+        $btnCancelStage.Size = New-Object System.Drawing.Size(130,34)
+        $btnCancelStage.Anchor = 'Bottom,Right'
+        $btnCancelStage.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+        Set-ModernButtonStyle $btnCancelStage $false
+        $stageForm.Controls.Add($btnCancelStage)
+        $stageForm.AcceptButton = $btnStageAll
+        $stageForm.CancelButton = $btnCancelStage
+
+        $form.UseWaitCursor = $false
+        if ($stageForm.ShowDialog($form) -ne [System.Windows.Forms.DialogResult]::OK) {
+            Append-Log 'Prefab 리소스 Stage를 취소했습니다.'
+            return
+        }
+        $btnStageAll.Enabled = $false
+        $btnCancelStage.Enabled = $false
+        $form.UseWaitCursor = $true
+        $stageAttempted = $true
+        Append-Log "Prefab 참조 리소스 $($candidates.Count)개를 Stage합니다..."
+        $stagedPaths = @(Add-PrefabDependencyStagePlan -Plan $plan)
+        foreach ($path in $stagedPaths) { Append-Log "Stage 완료: $path" }
+        Append-Log "Prefab 리소스 Stage 완료: $($stagedPaths.Count)개 파일"
+        Show-Info "Prefab에서 사용하는 추가/변경 리소스를 Stage했습니다.`r`n`r`n$($stagedPaths.Count)개 파일"
+    }
+    catch {
+        Append-Log "Prefab 리소스 Stage 중단: $($_.Exception.Message)"
+        $message = $_.Exception.Message
+        if ($stageAttempted) { $message += "`r`n`r`n'Prefab 리소스 Stage'를 다시 눌러 최신 목록을 조회해 주세요." }
+        Show-Error $message
+    }
+    finally {
+        if ($stageForm) { $stageForm.Dispose() }
+        Set-Busy $false
+        if ($stageAttempted) { Refresh-View }
     }
 }
 
@@ -1299,6 +2253,7 @@ function Run-Workflow {
 
 function Refresh-View {
     $repo = $txtRepo.Text.Trim()
+    $btnPrefabDependencyStage.Enabled = [bool]($repo -and (Test-Path -LiteralPath $repo -PathType Container))
     $listPushedCommits.Items.Clear()
     $script:VisiblePushedCommits = @()
     if (-not $repo -or -not (Test-Path $repo)) {
@@ -1394,7 +2349,7 @@ $form.ForeColor = [System.Drawing.SystemColors]::ControlText
 try { $form.Icon = [System.Drawing.Icon]::ExtractAssociatedIcon([Diagnostics.Process]::GetCurrentProcess().MainModule.FileName) } catch {}
 
 $lblTitle = New-Object System.Windows.Forms.Label
-$lblTitle.Text = 'GitHelper v1.0.4'
+$lblTitle.Text = $AppName
 $lblTitle.Font = New-Object System.Drawing.Font('Malgun Gothic',18,[System.Drawing.FontStyle]::Bold)
 $lblTitle.AutoSize = $true
 $lblTitle.Location = New-Object System.Drawing.Point(24,18)
@@ -1475,6 +2430,13 @@ $lblPushedCommits.AutoSize = $true
 $lblPushedCommits.Font = New-Object System.Drawing.Font('Malgun Gothic',10,[System.Drawing.FontStyle]::Bold)
 $lblPushedCommits.Location = New-Object System.Drawing.Point(28,382)
 $form.Controls.Add($lblPushedCommits)
+
+$btnPrefabDependencyStage = New-Object System.Windows.Forms.Button
+$btnPrefabDependencyStage.Text = 'Prefab 리소스 Stage'
+$btnPrefabDependencyStage.Location = New-Object System.Drawing.Point(590,372)
+$btnPrefabDependencyStage.Size = New-Object System.Drawing.Size(220,32)
+$btnPrefabDependencyStage.Enabled = $false
+$form.Controls.Add($btnPrefabDependencyStage)
 
 $listPushedCommits = New-Object System.Windows.Forms.ListBox
 $listPushedCommits.Location = New-Object System.Drawing.Point(28,409)
@@ -1601,7 +2563,7 @@ $layoutBaseBounds = @{}
 $layoutControls = @(
     $txtRepo,$btnAddFavorite,$btnRemoveFavorite,$btnBrowse,$btnRefresh,$lblStatus,
     $lblCommitCount,$listCommits,$btnDeleteCommit,$btnChangedFiles,$lblBranch,
-    $lblPushedCommits,$listPushedCommits,$txtBranch,$groupAfter,$btnRun,$btnCreateBranch,$btnMergeDevelop,$lblLog,$txtLog
+    $lblPushedCommits,$btnPrefabDependencyStage,$listPushedCommits,$txtBranch,$groupAfter,$btnRun,$btnCreateBranch,$btnMergeDevelop,$lblLog,$txtLog
 )
 
 function Initialize-MainWindowLayout {
@@ -1658,6 +2620,8 @@ function Update-MainWindowLayout {
 
     $pushedLabelBase = Get-LayoutBaseBounds $lblPushedCommits
     Set-ControlBounds $lblPushedCommits $pushedLabelBase.X ($pushedLabelBase.Y + $commitGrowth) $pushedLabelBase.Width $pushedLabelBase.Height
+    $prefabStageBase = Get-LayoutBaseBounds $btnPrefabDependencyStage
+    Set-ControlBounds $btnPrefabDependencyStage ($prefabStageBase.X + $widthDelta) ($prefabStageBase.Y + $commitGrowth) $prefabStageBase.Width $prefabStageBase.Height
 
     foreach ($control in @($lblBranch,$txtBranch,$btnRun,$btnCreateBranch,$btnMergeDevelop,$lblLog)) {
         $base = Get-LayoutBaseBounds $control
@@ -1671,7 +2635,7 @@ $form.Add_Resize({ Update-MainWindowLayout })
 
 Set-ModernButtonStyle $btnRun $true
 Set-ModernButtonStyle $btnMergeDevelop $true
-foreach ($button in @($btnBrowse,$btnRefresh,$btnDeleteCommit,$btnChangedFiles,$btnCreateBranch,$btnUpdate,$btnAddFavorite,$btnRemoveFavorite)) {
+foreach ($button in @($btnBrowse,$btnRefresh,$btnDeleteCommit,$btnChangedFiles,$btnPrefabDependencyStage,$btnCreateBranch,$btnUpdate,$btnAddFavorite,$btnRemoveFavorite)) {
     Set-ModernButtonStyle $button $false
 }
 
@@ -1716,6 +2680,7 @@ $txtRepo.Add_Leave({
 $btnRun.Add_Click({ Run-Workflow })
 $btnDeleteCommit.Add_Click({ Undo-LastCommit })
 $btnChangedFiles.Add_Click({ Show-SelectedChangedFiles })
+$btnPrefabDependencyStage.Add_Click({ Show-PrefabDependencyStageWindow })
 $listPushedCommits.Add_SelectedIndexChanged({ if ($listPushedCommits.SelectedIndices.Count -gt 0) { $listCommits.ClearSelected() } })
 $listCommits.Add_SelectedIndexChanged({ if ($listCommits.SelectedIndices.Count -gt 0) { $listPushedCommits.ClearSelected() } })
 $btnCreateBranch.Add_Click({ New-BranchAtHead })
