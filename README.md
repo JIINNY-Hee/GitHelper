@@ -68,6 +68,8 @@ git config user.email
 
 원하는 파일만 직접 커밋합니다. GitHelper는 커밋을 생성하지 않으며 이미 존재하는 커밋만 처리합니다.
 
+Unity Prefab을 커밋할 때는 먼저 Prefab을 Stage한 뒤 **Prefab 리소스 Stage**를 누르면 사용 중인 추가·변경 리소스를 함께 준비할 수 있습니다. 자세한 내용은 아래의 **Prefab 참조 리소스 함께 Stage**를 참고하세요.
+
 ```powershell
 git add <파일>
 git commit -m "feat(scope): 변경 내용"
@@ -133,6 +135,26 @@ Push 커밋 하나 또는 여러 개를 선택한 뒤 `변경 파일 보기`를 
 Rebase merge로 SHA가 달라진 커밋도 원격 기본 브랜치에 작성자 정보가 유지되어 있으면 목록에 표시됩니다.
 
 ## 기타 기능
+
+### Prefab 참조 리소스 함께 Stage
+
+현재 Git Stage(index)에 있는 추가·변경 Prefab을 읽어 저장된 참조를 재귀적으로 탐색합니다. 중첩 Prefab, Material, Texture, Shader, ScriptableObject, Animation, C# 파일과 리소스의 `.meta`, 상위 폴더의 `.meta` 중 추가·변경된 파일을 모읍니다. Shader의 로컬 `#include` 파일도 함께 확인합니다.
+
+프로젝트 전체 `.meta`를 검색하지 않습니다. Unity가 이미 만든 `Library/SourceAssetDB` 경로 색인에서 Prefab이 참조한 GUID만 조회하고, 연결된 파일만 읽습니다. 상위 폴더의 `.meta`도 추가·변경된 경우에만 읽습니다. 조회는 백그라운드에서 진행하며 **취소**로 중단할 수 있습니다. 확인 창에는 연결된 메타 파일 수와 경과 시간을 표시합니다.
+
+이 기능을 처음 사용하는 프로젝트는 Unity에서 한 번 열어 Import를 완료해야 합니다. 기존 경로 색인이 있으면 Editor를 닫아도 사용할 수 있습니다. 색인이 없거나 지원하지 않는 형식이면 전체 메타 검색으로 넘어가지 않고 원인을 안내합니다.
+
+1. Fork 등의 Git 프로그램에서 커밋할 Prefab을 먼저 Stage합니다.
+2. GitHelper에서 해당 저장소를 선택하고 **Prefab 리소스 Stage**를 누릅니다.
+3. 추가될 파일의 전체 경로, 추가/변경 상태와 참조 원인을 확인합니다.
+4. **모두 Stage**를 누르면 목록의 파일을 한 번에 Stage합니다.
+5. Git 프로그램에서 Stage 결과를 확인한 뒤 커밋합니다.
+
+이 기능은 원격 저장소 설정, fetch, GitHub 인증 없이 사용할 수 있습니다. Prefab을 여러 개 Stage해도 한 번에 처리하며, 사용하지 않는 변경 파일과 Git에서 제외한 새 파일은 추가하지 않습니다. 참조된 파일이 삭제된 경우에는 삭제를 자동 Stage하지 않고 확인 사항에 표시합니다.
+
+이미 Stage된 파일의 추가 수정은 보존합니다. 예를 들어 Prefab의 Material A 참조만 Stage하고 작업 폴더에서는 Material B로 바꾸었다면 A의 참조를 기준으로 탐색합니다. 이미 일부만 Stage한 Material이나 `.meta`도 기존 Stage 내용을 유지하며, 보호된 파일은 확인 창에 표시합니다. 목록을 확인한 뒤 파일 내용이나 Stage 상태가 바뀌면 재조회하도록 안내합니다.
+
+Unity의 텍스트로 저장된 GUID 참조와 `.meta`의 importer 참조를 기준으로 탐색합니다. 바이너리로 직렬화된 Unity 자산은 확인 사항에 표시되므로 **Asset Serialization → Force Text**로 저장한 후 다시 확인해 주세요. 외부 패키지, 누락·중복 GUID도 확인 사항에 표시합니다. FBX·Blend 원본 안에만 저장된 파일 참조와 `Resources.Load`나 Addressables의 문자열 주소 등 코드에서 동적으로 불러오는 리소스는 별도로 확인해야 합니다.
 
 ### 최근 커밋 되돌리기
 
@@ -202,10 +224,17 @@ PowerShell에서 `ps2exe` 모듈을 설치한 다음 빌드합니다.
 
 ```powershell
 Install-Module ps2exe -Scope CurrentUser
-.\Source\Build-Release.ps1 -Version 1.0.4
+.\Source\Build-Release.ps1 -Version 1.0.5
 ```
 
 결과물은 `EXE/GitHelper.exe`와 `EXE/GitHelper.zip`에 생성됩니다. 버전별 변경사항은 [CHANGELOG.md](CHANGELOG.md)를 참고하세요.
+
+Prefab Stage 기능의 검증은 실제 Git 임시 저장소에서 실행합니다.
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Tests\PrefabDependencyStage.Tests.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File .\Tests\PrefabDependencyDiscovery.Tests.ps1
+```
 
 ## 저장소 구조
 
@@ -213,6 +242,7 @@ Install-Module ps2exe -Scope CurrentUser
 .github/workflows/   GitHub Actions 설정
 docs/images/         README용 실제 프로그램 화면
 Source/              PowerShell 소스, 아이콘, 빌드 스크립트
+Tests/               Prefab 참조 Stage 회귀 검증
 EXE/                 로컬 빌드 결과물
 README.md            사용 및 빌드 안내
 CHANGELOG.md         버전별 변경 내역

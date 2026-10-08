@@ -1,5 +1,27 @@
 # ChangeLog
 
+## GitHelper v1.0.5 - 2026-10-06
+
+### 추가
+
+- 현재 Stage된 Unity Prefab의 추가·변경 참조 리소스를 한 번에 Stage하는 버튼 및 확인 창
+- 중첩 Prefab, Material, Texture, Shader, Animation 등 GUID 참조의 재귀 탐색과 로컬 Shader include 탐색
+- 리소스 `.meta`, importer 참조와 상위 폴더 `.meta` 함께 처리
+- 이미 Stage된 파일과 부분 Stage 내용 보호, 조회 후 파일·Stage 변경 시 재조회 안내
+- 외부·누락·중복 GUID, 바이너리 자산과 삭제된 참조 리소스 확인 사항 표시
+- 원격 설정 없는 로컬 저장소 및 여러 Unity 프로젝트가 포함된 저장소 지원
+- 실제 Git 저장소 기반 회귀 검증
+
+### 수정
+
+- Prefab Stage마다 프로젝트 전체 `.meta`를 열던 검색 제거
+- Unity의 기존 `Library/SourceAssetDB` 경로 색인에서 필요한 GUID만 직접 조회
+- Prefab에서 연결된 리소스와 해당 `.meta`만 읽고, 상위 폴더 `.meta`는 추가·변경이 있을 때만 처리
+- 변경된 Stage 메타의 GUID 검증은 Git blob 일괄 조회로 처리하고 기존 부분 Stage 보호 유지
+- 조회를 백그라운드로 옮겨 창 멈춤 해결, 취소 버튼 추가
+- 파일 재읽기·중복 해시 계산과 전체 Git 파일 목록의 PowerShell 순회 비용 감소
+- 무관한 메타 15,000개를 읽지 않는 첫 조회 검증과 UI 응답·취소 검증 추가
+
 ## GitHelper v1.0.4 - 2026-09-17
 
 ### 개선
