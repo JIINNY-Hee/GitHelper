@@ -17,8 +17,8 @@ $env:LANG = 'ko_KR.UTF-8'
 $env:LC_ALL = 'ko_KR.UTF-8'
 
 
-$AppName = 'GitHelper v1.0.5'
-$AppVersion = [version]'1.0.5'
+$AppName = 'GitHelper v1.0.6'
+$AppVersion = [version]'1.0.6'
 $GitHubRepo = 'JIINNY-Hee/GitHelper'
 $ConfigDir = Join-Path $env:APPDATA 'GitHelper'
 $ConfigPath = Join-Path $ConfigDir 'config.json'
@@ -129,6 +129,7 @@ $script:BaseBranches = @{}
 $script:AvailableBaseBranches = @()
 $script:LoadingBaseBranch = $false
 $script:GitExePath = 'git.exe'
+$script:IsBusy = $false
 
 function Invoke-Git {
     param([Parameter(Mandatory=$true)][string[]]$GitArgs, [switch]$RawOutput, [string]$StandardInput)
@@ -154,6 +155,175 @@ function Invoke-Gh {
         throw 'Git 저장소 경로가 설정되지 않았습니다.'
     }
     return Invoke-ProcessText -FilePath 'gh.exe' -Arguments $GhArgs -WorkingDirectory $script:CurrentRepo
+}
+
+function Get-ActiveGitProcesses {
+    # A process may belong to another repository; do not guess which index it owns.
+    return @(Get-Process -ErrorAction Stop | Where-Object { $_.ProcessName -match '^git($|-)' } |
+        Select-Object Id, ProcessName)
+}
+
+function Assert-GitIndexLockIdle {
+    $active = @(Get-ActiveGitProcesses)
+    if ($active.Count -gt 0) {
+        $names = ($active | ForEach-Object { "$($_.ProcessName) (PID $($_.Id))" }) -join ', '
+        throw "실행 중인 Git 작업이 있어 index.lock을 삭제하지 않았습니다.`r`n작업이 끝난 뒤 다시 시도해 주세요.`r`n`r`n$names"
+    }
+}
+
+function Get-GitIndexLockInfo([string]$Repo) {
+    if (-not $Repo -or -not (Test-Path -LiteralPath $Repo -PathType Container)) {
+        throw '올바른 저장소 폴더를 먼저 선택해 주세요.'
+    }
+    foreach ($name in @('GIT_DIR','GIT_WORK_TREE','GIT_COMMON_DIR','GIT_INDEX_FILE')) {
+        if ([Environment]::GetEnvironmentVariable($name)) {
+            throw "$name 환경 변수가 설정되어 있습니다. 선택한 저장소의 잠금 파일을 확인할 수 없어 삭제를 중단했습니다."
+        }
+    }
+
+    $previousRepo = $script:CurrentRepo
+    try {
+        $script:CurrentRepo = (Resolve-Path -LiteralPath $Repo -ErrorAction Stop).ProviderPath
+        $inside = Invoke-Git -GitArgs @('rev-parse','--is-inside-work-tree')
+        if ($inside.ExitCode -ne 0 -or $inside.StdOut -ne 'true') { throw '선택한 폴더가 Git 작업 저장소가 아닙니다.' }
+        $result = Invoke-Git -GitArgs @('rev-parse','--path-format=absolute','--git-path','index.lock')
+        if ($result.ExitCode -ne 0 -or -not [IO.Path]::IsPathRooted($result.StdOut)) {
+            throw "index.lock 경로를 확인하지 못했습니다.`r`n$($result.StdErr)"
+        }
+        $path = [IO.Path]::GetFullPath($result.StdOut)
+        if ([IO.Path]::GetFileName($path) -ne 'index.lock') { throw 'Git이 반환한 잠금 파일 경로가 올바르지 않습니다.' }
+        $info = [pscustomobject]@{
+            Repo=$script:CurrentRepo; Path=$path; Exists=$false
+            Length=0L; CreationTimeUtcTicks=0L; LastWriteTimeUtcTicks=0L; Hash=''
+        }
+        if (-not (Test-Path -LiteralPath $path -ErrorAction Stop)) { return $info }
+        $file = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+        if ($file.PSIsContainer -or ($file.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw 'index.lock이 일반 파일이 아니므로 삭제하지 않았습니다.'
+        }
+        $info.Exists = $true
+        $info.Length = $file.Length
+        $info.CreationTimeUtcTicks = $file.CreationTimeUtc.Ticks
+        $info.LastWriteTimeUtcTicks = $file.LastWriteTimeUtc.Ticks
+        $info.Hash = (Get-FileHash -LiteralPath $path -Algorithm SHA256 -ErrorAction Stop).Hash
+        return $info
+    }
+    finally { $script:CurrentRepo = $previousRepo }
+}
+
+function Remove-GitIndexLockFile($LockInfo) {
+    if (-not ('GitHelper.IndexLockFile' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Security.Cryptography;
+using Microsoft.Win32.SafeHandles;
+
+namespace GitHelper {
+    public static class IndexLockFile {
+        [StructLayout(LayoutKind.Sequential)]
+        private struct FileInfo {
+            public uint Attributes;
+            public System.Runtime.InteropServices.ComTypes.FILETIME Creation, Access, Write;
+            public uint Volume, SizeHigh, SizeLow, Links, IndexHigh, IndexLow;
+        }
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern SafeFileHandle CreateFileW(string path, uint access, uint share,
+            IntPtr security, uint disposition, uint flags, IntPtr template);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetFileInformationByHandle(SafeFileHandle handle, out FileInfo info);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool SetFileInformationByHandle(SafeFileHandle handle, int infoClass,
+            ref byte deleteFile, uint size);
+
+        private static long Ticks(System.Runtime.InteropServices.ComTypes.FILETIME time) {
+            return DateTime.FromFileTimeUtc(((long)time.dwHighDateTime << 32) | (uint)time.dwLowDateTime).Ticks;
+        }
+        private static void Fail() {
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+        }
+        public static void Remove(string path, long length, long created, long written, string hash) {
+            // OPEN_EXISTING, GENERIC_READ | DELETE, exclusive sharing, OPEN_REPARSE_POINT.
+            // Mark the validated handle for deletion only after all checks pass:
+            // https://learn.microsoft.com/windows/win32/api/fileapi/nf-fileapi-setfileinformationbyhandle
+            using (SafeFileHandle handle = CreateFileW(path, 0x80010000, 0, IntPtr.Zero, 3, 0x00200000, IntPtr.Zero)) {
+                if (handle.IsInvalid) Fail();
+                FileInfo info;
+                if (!GetFileInformationByHandle(handle, out info)) Fail();
+                if ((info.Attributes & 0x410) != 0)
+                    throw new IOException("index.lock이 일반 파일이 아니므로 삭제하지 않았습니다.");
+                if ((((long)info.SizeHigh << 32) | info.SizeLow) != length ||
+                    Ticks(info.Creation) != created || Ticks(info.Write) != written)
+                    throw new IOException("확인 이후 index.lock이 변경되어 삭제하지 않았습니다.");
+                using (FileStream stream = new FileStream(handle, FileAccess.Read)) {
+                    using (SHA256 sha = SHA256.Create()) {
+                        string actual = BitConverter.ToString(sha.ComputeHash(stream)).Replace("-", "");
+                        if (!String.Equals(actual, hash, StringComparison.OrdinalIgnoreCase))
+                            throw new IOException("확인 이후 index.lock이 변경되어 삭제하지 않았습니다.");
+                    }
+                    byte deleteFile = 1; // FILE_DISPOSITION_INFO.DeleteFile (BOOLEAN).
+                    if (!SetFileInformationByHandle(handle, 4, ref deleteFile, 1)) Fail();
+                }
+            }
+        }
+    }
+}
+'@ -ErrorAction Stop
+    }
+    [GitHelper.IndexLockFile]::Remove($LockInfo.Path, $LockInfo.Length,
+        $LockInfo.CreationTimeUtcTicks, $LockInfo.LastWriteTimeUtcTicks, $LockInfo.Hash)
+}
+
+function Remove-GitIndexLock {
+    param([Parameter(Mandatory=$true)]$LockInfo)
+
+    Assert-GitIndexLockIdle
+    $current = Get-GitIndexLockInfo -Repo $LockInfo.Repo
+    if (-not $current.Exists) { return $false }
+    foreach ($property in @('Path','Length','CreationTimeUtcTicks','LastWriteTimeUtcTicks','Hash')) {
+        if (-not $LockInfo.Exists -or $current.$property -ne $LockInfo.$property) {
+            throw '확인 이후 index.lock이 변경되었습니다. 삭제하지 않았으니 다시 확인해 주세요.'
+        }
+    }
+    Assert-GitIndexLockIdle
+    # The exclusive handle prevents a GUI client from changing/replacing the
+    # validated file between inspection and deletion. No UI events are pumped.
+    Remove-GitIndexLockFile $current
+    if (Test-Path -LiteralPath $current.Path -ErrorAction Stop) {
+        throw 'index.lock이 남아 있거나 다시 생성되었습니다. 진행 중인 Git 작업을 확인해 주세요.'
+    }
+    return $true
+}
+
+function Clear-SelectedRepoIndexLock {
+    if ($script:IsBusy) { return }
+    Set-Busy $true
+    try {
+        $info = Get-GitIndexLockInfo -Repo $txtRepo.Text.Trim()
+        if (-not $info.Exists) {
+            Append-Log "삭제할 index.lock 파일이 없습니다: $($info.Path)"
+            Show-Info "삭제할 index.lock 파일이 없습니다.`r`n`r`n$($info.Path)"
+            return
+        }
+        Assert-GitIndexLockIdle
+        $message = "선택한 저장소의 index.lock 파일을 삭제합니다.`r`n`r`n$($info.Path)`r`n`r`nFork 등 다른 Git 프로그램에서 진행 중인 작업이 없는지 확인해 주세요. 중단된 작업이 남긴 잠금 파일만 삭제해야 합니다.`r`n`r`n삭제할까요?"
+        $answer = [System.Windows.Forms.MessageBox]::Show($form, $message, $AppName, 'YesNo', 'Warning', 'Button2')
+        if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+        if (Remove-GitIndexLock -LockInfo $info) {
+            Append-Log "index.lock 삭제 완료: $($info.Path)"
+            Show-Info "index.lock 파일을 삭제했습니다.`r`n`r`n$($info.Path)`r`n`r`n중단되었던 Git 작업을 다시 실행해 주세요."
+        } else {
+            Append-Log "index.lock이 이미 없어졌습니다: $($info.Path)"
+            Show-Info 'index.lock 파일이 이미 없어져 삭제할 필요가 없습니다.'
+        }
+    }
+    catch {
+        Append-Log "index.lock 삭제 중단: $($_.Exception.Message)"
+        Show-Error $_.Exception.Message
+    }
+    finally { Set-Busy $false }
 }
 
 function Get-StageGitOutput([string[]]$GitArgs) {
@@ -1285,6 +1455,7 @@ function Append-Log([string]$Text) {
 }
 
 function Set-Busy([bool]$Busy) {
+    $script:IsBusy = $Busy
     $btnRefresh.Enabled = -not $Busy
     $btnBrowse.Enabled = -not $Busy
     $btnAddFavorite.Enabled = -not $Busy
@@ -1293,6 +1464,7 @@ function Set-Busy([bool]$Busy) {
     $btnDeleteCommit.Enabled = (-not $Busy) -and ($script:VisibleCommits.Count -gt 0)
     $btnChangedFiles.Enabled = (-not $Busy) -and (($script:VisibleCommits.Count -gt 0) -or ($script:VisiblePushedCommits.Count -gt 0))
     $btnPrefabDependencyStage.Enabled = (-not $Busy) -and ($txtRepo.Text.Trim()) -and (Test-Path -LiteralPath $txtRepo.Text.Trim() -PathType Container)
+    $btnDeleteIndexLock.Enabled = (-not $Busy) -and ($txtRepo.Text.Trim()) -and (Test-Path -LiteralPath $txtRepo.Text.Trim() -PathType Container)
     $btnCreateBranch.Enabled = -not $Busy
     $btnMergeDevelop.Enabled = (-not $Busy) -and ($btnMergeDevelop.Tag -eq 'Allowed')
     $btnUpdate.Enabled = -not $Busy
@@ -2254,6 +2426,7 @@ function Run-Workflow {
 function Refresh-View {
     $repo = $txtRepo.Text.Trim()
     $btnPrefabDependencyStage.Enabled = [bool]($repo -and (Test-Path -LiteralPath $repo -PathType Container))
+    $btnDeleteIndexLock.Enabled = [bool]((-not $script:IsBusy) -and $repo -and (Test-Path -LiteralPath $repo -PathType Container))
     $listPushedCommits.Items.Clear()
     $script:VisiblePushedCommits = @()
     if (-not $repo -or -not (Test-Path $repo)) {
@@ -2402,10 +2575,17 @@ $btnRefresh.Location = New-Object System.Drawing.Point(690,158)
 $btnRefresh.Size = New-Object System.Drawing.Size(120,32)
 $form.Controls.Add($btnRefresh)
 
+$btnDeleteIndexLock = New-Object System.Windows.Forms.Button
+$btnDeleteIndexLock.Text = 'index.lock 삭제'
+$btnDeleteIndexLock.Location = New-Object System.Drawing.Point(530,158)
+$btnDeleteIndexLock.Size = New-Object System.Drawing.Size(150,32)
+$btnDeleteIndexLock.Enabled = $false
+$form.Controls.Add($btnDeleteIndexLock)
+
 $lblStatus = New-Object System.Windows.Forms.Label
 $lblStatus.Text = '저장소 확인 중...'
 $lblStatus.AutoSize = $false
-$lblStatus.Size = New-Object System.Drawing.Size(650,45)
+$lblStatus.Size = New-Object System.Drawing.Size(490,45)
 $lblStatus.Location = New-Object System.Drawing.Point(28,158)
 $form.Controls.Add($lblStatus)
 
@@ -2561,7 +2741,7 @@ $form.Controls.Add($txtLog)
 $layoutBaseClientSize = $null
 $layoutBaseBounds = @{}
 $layoutControls = @(
-    $txtRepo,$btnAddFavorite,$btnRemoveFavorite,$btnBrowse,$btnRefresh,$lblStatus,
+    $txtRepo,$btnAddFavorite,$btnRemoveFavorite,$btnBrowse,$btnRefresh,$btnDeleteIndexLock,$lblStatus,
     $lblCommitCount,$listCommits,$btnDeleteCommit,$btnChangedFiles,$lblBranch,
     $lblPushedCommits,$btnPrefabDependencyStage,$listPushedCommits,$txtBranch,$groupAfter,$btnRun,$btnCreateBranch,$btnMergeDevelop,$lblLog,$txtLog
 )
@@ -2613,7 +2793,7 @@ function Update-MainWindowLayout {
         Set-ControlBounds $control $base.X $y ($base.Width + $widthDelta) $height
     }
 
-    foreach ($control in @($btnAddFavorite,$btnRemoveFavorite,$btnBrowse,$btnRefresh,$btnDeleteCommit,$btnChangedFiles,$groupAfter)) {
+    foreach ($control in @($btnAddFavorite,$btnRemoveFavorite,$btnBrowse,$btnRefresh,$btnDeleteIndexLock,$btnDeleteCommit,$btnChangedFiles,$groupAfter)) {
         $base = Get-LayoutBaseBounds $control
         Set-ControlBounds $control ($base.X + $widthDelta) ($base.Y + $(if ($control -in @($groupAfter)) { $lowerShift } else { 0 })) $base.Width $base.Height
     }
@@ -2635,7 +2815,7 @@ $form.Add_Resize({ Update-MainWindowLayout })
 
 Set-ModernButtonStyle $btnRun $true
 Set-ModernButtonStyle $btnMergeDevelop $true
-foreach ($button in @($btnBrowse,$btnRefresh,$btnDeleteCommit,$btnChangedFiles,$btnPrefabDependencyStage,$btnCreateBranch,$btnUpdate,$btnAddFavorite,$btnRemoveFavorite)) {
+foreach ($button in @($btnBrowse,$btnRefresh,$btnDeleteIndexLock,$btnDeleteCommit,$btnChangedFiles,$btnPrefabDependencyStage,$btnCreateBranch,$btnUpdate,$btnAddFavorite,$btnRemoveFavorite)) {
     Set-ModernButtonStyle $button $false
 }
 
@@ -2681,6 +2861,7 @@ $btnRun.Add_Click({ Run-Workflow })
 $btnDeleteCommit.Add_Click({ Undo-LastCommit })
 $btnChangedFiles.Add_Click({ Show-SelectedChangedFiles })
 $btnPrefabDependencyStage.Add_Click({ Show-PrefabDependencyStageWindow })
+$btnDeleteIndexLock.Add_Click({ Clear-SelectedRepoIndexLock })
 $listPushedCommits.Add_SelectedIndexChanged({ if ($listPushedCommits.SelectedIndices.Count -gt 0) { $listCommits.ClearSelected() } })
 $listCommits.Add_SelectedIndexChanged({ if ($listCommits.SelectedIndices.Count -gt 0) { $listPushedCommits.ClearSelected() } })
 $btnCreateBranch.Add_Click({ New-BranchAtHead })
