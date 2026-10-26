@@ -2,6 +2,8 @@
 
 GitHelper는 Windows에서 로컬 커밋을 작업 브랜치와 PR로 옮겨 기본 브랜치에 반영하는 Git 작업 도우미입니다.
 
+현재 버전은 **v1.0.6 (2026-10-26)**입니다. 이 버전에서는 중단된 Git 작업이 남긴 `index.lock`을 경로 확인 후 삭제하는 기능을 추가했습니다. 자세한 변경 사항은 [CHANGELOG.md](CHANGELOG.md)를 참고하세요.
+
 로컬 기본 브랜치에서 작업한 뒤 필요한 내용만 커밋하면 GitHelper가 다음 과정을 처리합니다.
 
 1. 최신 원격 기본 브랜치에서 임시 feature 브랜치를 생성합니다.
@@ -136,6 +138,14 @@ Rebase merge로 SHA가 달라진 커밋도 원격 기본 브랜치에 작성자 
 
 ## 기타 기능
 
+### index.lock 삭제
+
+Git 작업이 비정상 종료되어 `index.lock` 오류가 계속될 때, 저장소를 선택하고 **새로고침** 왼쪽의 **index.lock 삭제**를 누릅니다. 확인 창에 표시된 경로를 확인한 후 삭제하면 중단되었던 Git 작업을 다시 실행할 수 있습니다.
+
+Git에서 선택한 저장소의 실제 잠금 경로를 조회하므로 별도 worktree도 지원하며, 원격 저장소 설정이나 GitHub 인증이 없어도 사용할 수 있습니다. 잠금 파일 하나만 삭제하고 Stage 내용과 작업 파일은 유지합니다. 파일이 없으면 안내만 표시합니다.
+
+GitHelper에서 다른 작업이 진행 중일 때는 버튼이 비활성화됩니다. 다른 저장소를 포함해 실행 중인 Git 프로세스가 감지되거나, 파일을 다른 프로그램이 사용 중이거나, 확인 이후 파일이 변경되면 삭제를 중단합니다. Fork 등 다른 Git 프로그램의 작업이 모두 끝났는지 확인한 뒤 사용해 주세요.
+
 ### Prefab 참조 리소스 함께 Stage
 
 현재 Git Stage(index)에 있는 추가·변경 Prefab을 읽어 저장된 참조를 재귀적으로 탐색합니다. 중첩 Prefab, Material, Texture, Shader, ScriptableObject, Animation, C# 파일과 리소스의 `.meta`, 상위 폴더의 `.meta` 중 추가·변경된 파일을 모읍니다. Shader의 로컬 `#include` 파일도 함께 확인합니다.
@@ -224,7 +234,7 @@ PowerShell에서 `ps2exe` 모듈을 설치한 다음 빌드합니다.
 
 ```powershell
 Install-Module ps2exe -Scope CurrentUser
-.\Source\Build-Release.ps1 -Version 1.0.5
+.\Source\Build-Release.ps1 -Version 1.0.6
 ```
 
 결과물은 `EXE/GitHelper.exe`와 `EXE/GitHelper.zip`에 생성됩니다. 버전별 변경사항은 [CHANGELOG.md](CHANGELOG.md)를 참고하세요.
@@ -236,13 +246,19 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Tests\PrefabDependency
 powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File .\Tests\PrefabDependencyDiscovery.Tests.ps1
 ```
 
+index.lock 삭제 기능의 검증은 별도 임시 저장소에서 실행하며 커밋을 생성하지 않습니다.
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Tests\IndexLockCleanup.Tests.ps1
+```
+
 ## 저장소 구조
 
 ```text
 .github/workflows/   GitHub Actions 설정
 docs/images/         README용 실제 프로그램 화면
 Source/              PowerShell 소스, 아이콘, 빌드 스크립트
-Tests/               Prefab 참조 Stage 회귀 검증
+Tests/               Prefab 참조 Stage 및 index.lock 삭제 검증
 EXE/                 로컬 빌드 결과물
 README.md            사용 및 빌드 안내
 CHANGELOG.md         버전별 변경 내역
