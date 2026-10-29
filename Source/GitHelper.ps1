@@ -708,15 +708,39 @@ function Get-StageCheckCancelled([scriptblock]$ShouldCancel) {
     }
 }
 
+function Get-StageWorktreeMetadataOverrides([string]$Prefix, $Context) {
+    if ($Context.WorktreeGuidOverrides.ContainsKey($Prefix)) { return }
+    $map = @{}
+    # Only Git-reported changes, and only after an actual reference misses the
+    # Unity index. Never enumerate the project's metadata on disk.
+    foreach ($path in $Context.Snapshot.Status.Keys) {
+        Get-StageCheckCancelled $Context.ShouldCancel
+        if (-not $path.EndsWith('.meta',[StringComparison]::OrdinalIgnoreCase) -or
+            (Get-UnityProjectPrefix $path) -ne $Prefix) { continue }
+        $code = $Context.Snapshot.Status[$path]
+        if ($code -ne '??' -and ($code[0] -ne ' ' -or $code[1] -notin @('M','T','A'))) { continue }
+        $text = Get-UnityStageText $path $Context -Meta
+        if ($text -match '(?m)^guid:\s*([0-9a-fA-F]{32})\s*$') {
+            $guid = $Matches[1].ToLowerInvariant()
+            if (-not $map.ContainsKey($guid)) { $map[$guid] = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase) }
+            [void]$map[$guid].Add($path.Substring(0,$path.Length-5))
+        }
+    }
+    $Context.WorktreeGuidOverrides[$Prefix] = $map
+}
+
 function Get-UnityGuidLookup {
-    param([string]$Prefix,[string[]]$Guids,$Context)
+    param([string]$Prefix,[string[]]$Guids,$Context,[string[]]$AssetGuids=@())
     Get-StageCheckCancelled $Context.ShouldCancel
     if (-not $Context.GuidCache.ContainsKey($Prefix)) { $Context.GuidCache[$Prefix] = @{} }
     $cache = $Context.GuidCache[$Prefix]
     $missing = @($Guids | Sort-Object -Unique | Where-Object { $_ -notmatch '^0{16}' -and -not $cache.ContainsKey($_) })
-    if ($missing.Count -eq 0) { return $cache }
-    $Context.GuidLookupRequests++
-    if ($Context.ResolveGuids) {
+    $resolved = @{}
+    if ($missing.Count -gt 0) { $Context.GuidLookupRequests++ }
+    if ($missing.Count -eq 0) {
+        # A cached ShaderGraph object ID can later occur as a real GUID field.
+        # Still allow the metadata fallback without repeating the DB lookup.
+    } elseif ($Context.ResolveGuids) {
         $resolved = & $Context.ResolveGuids $Prefix $missing
     } else {
         $project = Join-Path $script:CurrentRepo $Prefix
@@ -735,7 +759,14 @@ function Get-UnityGuidLookup {
         $paths = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
         if ($resolved) {
             foreach ($path in @($resolved[$guid])) {
-                if ($path -and (Get-UnityProjectPrefix $path) -eq $Prefix -and (Get-UnityStageSafePath $path $Context.Snapshot)) { [void]$paths.Add($path) }
+                if (-not $path -or (Get-UnityProjectPrefix $path) -ne $Prefix -or -not (Get-UnityStageSafePath $path $Context.Snapshot)) { continue }
+                $metaPath = "$path.meta"
+                $metaCode = $Context.Snapshot.Status[$metaPath]
+                if ($metaCode -and $metaCode[0] -eq 'D') { continue }
+                # Library can still point to a moved file, or to a GUID that
+                # differs from the protected staged metadata. Verify the path.
+                $text = Get-UnityStageText $metaPath $Context -Meta
+                if ($text -match '(?m)^guid:\s*([0-9a-fA-F]{32})\s*$' -and $Matches[1] -eq $guid) { [void]$paths.Add($path) }
             }
         }
         # Only dirty metadata in the Git index needs an overlay: staged GUIDs
@@ -744,6 +775,21 @@ function Get-UnityGuidLookup {
             foreach ($path in $Context.IndexGuidOverrides[$Prefix][$guid]) { [void]$paths.Add($path) }
         }
         $cache[$guid] = @($paths)
+    }
+    $unresolved = @($AssetGuids | Where-Object { $_ -notmatch '^0{16}' -and @($cache[$_]).Count -eq 0 })
+    if ($unresolved.Count -gt 0) { Get-StageWorktreeMetadataOverrides $Prefix $Context }
+    if ($Context.WorktreeGuidOverrides.ContainsKey($Prefix)) {
+        # Include overrides even when Library returned a path: the fallback
+        # may expose duplicate GUIDs, which must keep the existing safeguards.
+        foreach ($guid in @($cache.Keys)) {
+            if ($Context.WorktreeGuidOverrides[$Prefix].ContainsKey($guid)) {
+                $cache[$guid] = @(@($cache[$guid]) + @($Context.WorktreeGuidOverrides[$Prefix][$guid]) | Sort-Object -Unique)
+                if ($cache[$guid].Count -gt 1) {
+                    [void]$Context.Warnings.Add("중복 GUID의 리소스는 제외했습니다. 이동한 파일은 이전 경로의 삭제도 함께 Stage해 주세요: $guid ($($cache[$guid] -join ', '))")
+                    foreach ($assetPath in $cache[$guid]) { [void]$Context.BlockedAssets.Add($assetPath) }
+                }
+            }
+        }
     }
     return $cache
 }
@@ -809,7 +855,7 @@ function Get-PrefabDependencyStagePlan {
         Candidates=@{}; Reasons=@{}; Visited=(New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase));
         BlockedAssets=(New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase));
         ProjectPrefixes=(New-Object 'System.Collections.Generic.HashSet[string]');
-        GuidCache=@{}; IndexGuidOverrides=@{}; ResolveGuids=$ResolveGuids; ShouldCancel=$ShouldCancel;
+        GuidCache=@{}; IndexGuidOverrides=@{}; WorktreeGuidOverrides=@{}; ResolveGuids=$ResolveGuids; ShouldCancel=$ShouldCancel;
         MetaFilesRead=0; IndexMetadataRead=0; GuidLookupRequests=0; ReadPaths=(New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase))
     }
     $plan = [pscustomobject]@{
@@ -831,6 +877,7 @@ function Get-PrefabDependencyStagePlan {
         Get-StageCheckCancelled $ShouldCancel
         $references = New-Object 'System.Collections.Generic.List[object]'
         $requests = @{}
+        $assetRequests = @{}
         $waveCount = $queue.Count
         for ($n=0; $n -lt $waveCount; $n++) {
             Get-StageCheckCancelled $ShouldCancel
@@ -864,10 +911,15 @@ function Get-PrefabDependencyStagePlan {
             $content=Get-UnityStageText $path $context -Meta:($path.EndsWith('.meta',[StringComparison]::OrdinalIgnoreCase))
             if ($null -eq $content) { continue }
             if (-not $requests.ContainsKey($prefix)) { $requests[$prefix]=New-Object 'System.Collections.Generic.HashSet[string]' }
+            if (-not $assetRequests.ContainsKey($prefix)) { $assetRequests[$prefix]=New-Object 'System.Collections.Generic.HashSet[string]' }
+            # Keep identity lookups for duplicate checks, but a metadata file's
+            # own GUID must not trigger the fallback for missing dependencies.
+            $ownGuid = if ($path.EndsWith('.meta',[StringComparison]::OrdinalIgnoreCase) -and $content -match '(?m)^guid:\s*([0-9a-fA-F]{32})\s*$') { $Matches[1] } else { $null }
             foreach ($match in [regex]::Matches($content,'(?i)(?<![0-9a-f])[0-9a-f]{32}(?![0-9a-f])')) {
                 $guid=$match.Value.ToLowerInvariant()
                 if ($guid -match '^0{16}') { continue }
                 [void]$requests[$prefix].Add($guid)
+                if ($guid -ne $ownGuid -and $content -match ('(?i)\bguid(?:\\?"|\x27)?\s*[:=]\s*(?:\\?"|\x27)?'+$guid+'\b')) { [void]$assetRequests[$prefix].Add($guid) }
                 $references.Add([pscustomobject]@{Prefix=$prefix; Guid=$guid; Source=$path})
             }
             if ([IO.Path]::GetExtension($path) -in @('.shader','.hlsl','.cginc','.compute','.glsl')) {
@@ -883,7 +935,7 @@ function Get-PrefabDependencyStagePlan {
                 }
             }
         }
-        foreach ($prefix in $requests.Keys) { [void](Get-UnityGuidLookup -Prefix $prefix -Guids @($requests[$prefix]) -Context $context) }
+        foreach ($prefix in $requests.Keys) { [void](Get-UnityGuidLookup -Prefix $prefix -Guids @($requests[$prefix]) -AssetGuids @($assetRequests[$prefix]) -Context $context) }
         foreach ($reference in $references) {
             $paths=@($context.GuidCache[$reference.Prefix][$reference.Guid])
             if ($paths.Count -gt 1) {
@@ -896,6 +948,8 @@ function Get-PrefabDependencyStagePlan {
                 # ShaderGraph object IDs are not asset GUIDs. Warn only for
                 # unresolved serialized asset reference fields, not every ID.
                 $sourceText=$context.TextCache[$reference.Source]
+                if ($reference.Source.EndsWith('.meta',[StringComparison]::OrdinalIgnoreCase) -and
+                    $sourceText -match ('(?im)^guid:\s*'+$reference.Guid+'\s*$')) { continue }
                 if ($sourceText -match ('(?i)\bguid(?:\\?"|\x27)?\s*[:=]\s*(?:\\?"|\x27)?'+$reference.Guid+'\b')) {
                     [void]$context.Warnings.Add("Unity에서 참조 GUID 경로를 찾지 못했습니다. Import 또는 외부 패키지를 확인해 주세요: $($reference.Guid) ← $($reference.Source)")
                 }
