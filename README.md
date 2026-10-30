@@ -2,7 +2,7 @@
 
 GitHelper는 Windows에서 로컬 커밋을 작업 브랜치와 PR로 옮겨 기본 브랜치에 반영하는 Git 작업 도우미입니다.
 
-현재 버전은 **v1.0.6 (2026-10-26)**입니다. 이 버전에서는 중단된 Git 작업이 남긴 `index.lock`을 경로 확인 후 삭제하는 기능을 추가했습니다. 자세한 변경 사항은 [CHANGELOG.md](CHANGELOG.md)를 참고하세요.
+현재 버전은 **v1.0.7 (2026-10-29)**입니다. 이 버전에서는 Unity 경로 색인이 오래되었을 때 Prefab 참조 리소스가 Stage에서 누락되는 문제를 수정했습니다. 자세한 변경 사항은 [CHANGELOG.md](CHANGELOG.md)를 참고하세요.
 
 로컬 기본 브랜치에서 작업한 뒤 필요한 내용만 커밋하면 GitHelper가 다음 과정을 처리합니다.
 
@@ -236,7 +236,7 @@ PowerShell에서 `ps2exe` 모듈을 설치한 다음 빌드합니다.
 
 ```powershell
 Install-Module ps2exe -Scope CurrentUser
-.\Source\Build-Release.ps1 -Version 1.0.6
+.\Source\Build-Release.ps1 -Version 1.0.7
 ```
 
 결과물은 `EXE/GitHelper.exe`와 `EXE/GitHelper.zip`에 생성됩니다. 버전별 변경사항은 [CHANGELOG.md](CHANGELOG.md)를 참고하세요.
