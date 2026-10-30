@@ -17,8 +17,8 @@ $env:LANG = 'ko_KR.UTF-8'
 $env:LC_ALL = 'ko_KR.UTF-8'
 
 
-$AppName = 'GitHelper v1.0.6'
-$AppVersion = [version]'1.0.6'
+$AppName = 'GitHelper v1.0.7'
+$AppVersion = [version]'1.0.7'
 $GitHubRepo = 'JIINNY-Hee/GitHelper'
 $ConfigDir = Join-Path $env:APPDATA 'GitHelper'
 $ConfigPath = Join-Path $ConfigDir 'config.json'
